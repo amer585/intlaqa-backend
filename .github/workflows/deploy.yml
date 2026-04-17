@@ -13,8 +13,6 @@ jobs:
         with:
           fetch-depth: 0
       - name: Deploy to Gigalixir
-        uses: mhanberg/gigalixir-action@v0.6.0
-        with:
-          GIGALIXIR_USERNAME: ${{ secrets.GIGALIXIR_EMAIL }}
-          GIGALIXIR_PASSWORD: ${{ secrets.GIGALIXIR_API_KEY }}
-          GIGALIXIR_APP: madrastna-backend
+        run: |
+          git remote add gigalixir https://${{ secrets.GIGALIXIR_EMAIL }}:${{ secrets.GIGALIXIR_API_KEY }}@git.gigalixir.com/madrastna-backend.git
+          git push gigalixir main -f
