@@ -8,6 +8,16 @@ app.use(cors());
 app.use(express.json());
 
 // ─────────────────────────────────────────────────────────
+// GLOBAL ERROR HANDLERS — prevent container from crashing
+// ─────────────────────────────────────────────────────────
+process.on('uncaughtException', (err) => {
+  console.error('⚠️ Uncaught Exception:', err.message);
+});
+process.on('unhandledRejection', (err) => {
+  console.error('⚠️ Unhandled Rejection:', err);
+});
+
+// ─────────────────────────────────────────────────────────
 // CONNECTION POOL CACHE (optimized for Back4App 256MB RAM)
 // ─────────────────────────────────────────────────────────
 const pools = {};
@@ -15,8 +25,10 @@ const pools = {};
 function getPool(dbUrl) {
   if (!dbUrl) throw new Error('Database URL is undefined — check your environment variables.');
   if (!pools[dbUrl]) {
+    // Strip ssl params from URL to avoid conflict with explicit ssl config
+    const cleanUrl = dbUrl.replace(/[?&]ssl=[^&]*/g, '');
     pools[dbUrl] = mysql.createPool({
-      uri: dbUrl,
+      uri: cleanUrl,
       ssl: { rejectUnauthorized: true },
       waitForConnections: true,
       connectionLimit: 1,
@@ -50,7 +62,16 @@ const GOVERNORATES = [
 
 // Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'Madrastna Backend API', timestamp: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    service: 'Madrastna Backend API',
+    timestamp: new Date().toISOString(),
+    env_check: {
+      DB_PRIMARY: !!process.env.DB_PRIMARY,
+      DB_PREP: !!process.env.DB_PREP,
+      DB_SECONDARY: !!process.env.DB_SECONDARY,
+    }
+  });
 });
 
 // ── Student Login ────────────────────────────────────────
@@ -223,6 +244,9 @@ const PORT = process.env.PORT || 3000;
 
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Madrastna Backend running on port ${PORT}`);
+  console.log(`   DB_PRIMARY set: ${!!process.env.DB_PRIMARY}`);
+  console.log(`   DB_PREP set: ${!!process.env.DB_PREP}`);
+  console.log(`   DB_SECONDARY set: ${!!process.env.DB_SECONDARY}`);
 });
 
 // Graceful shutdown — close all DB pools when container stops
@@ -232,7 +256,7 @@ async function shutdown(signal) {
     for (const [url, pool] of Object.entries(pools)) {
       try {
         await pool.end();
-        console.log(`  ✓ Closed pool for ${url.substring(0, 30)}...`);
+        console.log(`  ✓ Closed pool`);
       } catch (err) {
         console.error(`  ✗ Error closing pool: ${err.message}`);
       }
