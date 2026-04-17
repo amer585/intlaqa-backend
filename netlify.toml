@@ -1,0 +1,7 @@
+[build]
+  functions = "functions"
+
+[dev]
+  functions = "functions"
+  framework = "#static"
+  autoLaunch = false

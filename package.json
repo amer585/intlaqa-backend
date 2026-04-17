@@ -1,0 +1,17 @@
+{
+  "name": "intlaqa-backend",
+  "version": "1.0.0",
+  "description": "INTLAQA National Education Platform — Netlify Functions API",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "test": "echo \"No tests configured\" && exit 0"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "mysql2": "^3.22.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

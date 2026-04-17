@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Local Netlify folder
+.netlify/
+
+# Environment variables (NEVER commit)
+.env
+
+# Deno artifacts
+deno.lock
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
