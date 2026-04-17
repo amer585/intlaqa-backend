@@ -11,6 +11,7 @@ function getPool(dbUrl) {
   if (!pools[dbUrl]) {
     pools[dbUrl] = mysql.createPool({
       uri: dbUrl,
+      ssl: { rejectUnauthorized: true },
       waitForConnections: true,
       connectionLimit: 1,
       maxIdle: 1,

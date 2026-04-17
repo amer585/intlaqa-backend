@@ -42,7 +42,7 @@ exports.handler = async () => {
 
     let connection;
     try {
-      connection = await mysql.createConnection(uri);
+      connection = await mysql.createConnection({ uri, ssl: { rejectUnauthorized: true } });
       
       for (const statement of sqlStatements) {
         await connection.query(statement);
