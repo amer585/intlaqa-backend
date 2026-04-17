@@ -121,7 +121,7 @@ exports.handler = async (event) => {
       ]);
 
       await connection.execute(
-        `INSERT INTO activity_logs (ssn_encrypted, action_type, metadata) VALUES ${placeholders}`,
+        `INSERT INTO test.activity_logs (ssn_encrypted, action_type, metadata) VALUES ${placeholders}`,
         values
       );
 

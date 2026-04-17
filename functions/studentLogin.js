@@ -100,7 +100,7 @@ exports.handler = async (event) => {
     // This query bypasses the optimizer and fetches exactly 1 row instantly.
     const [rows] = await connection.execute(
       `SELECT student_name_ar, school_name, class_name, admin_zone, gov_code, gender
-       FROM students
+       FROM test.students
        WHERE ssn_encrypted = ?`,
       [String(ssn_encrypted)]
     );

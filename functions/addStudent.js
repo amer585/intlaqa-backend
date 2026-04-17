@@ -111,44 +111,54 @@ exports.handler = async (event) => {
     };
   }
 
+  const GOVERNORATES = [
+    "القاهرة", "الإسكندرية", "الجيزة", "القليوبية", "الدقهلية", "الشرقية", "الغربية", 
+    "المنوفية", "البحيرة", "كفر الشيخ", "دمياط", "بورسعيد", "الإسماعيلية", "السويس", 
+    "مطروح", "شمال سيناء", "جنوب سيناء", "بني سويف", "الفيوم", "المنيا", "أسيوط", 
+    "سوهاج", "قنا", "الأقصر", "أسوان", "البحر الأحمر", "الوادي الجديد"
+  ];
+  let numericGovCode = GOVERNORATES.indexOf(gov_code) + 1;
+  if (numericGovCode === 0) numericGovCode = 1;
+
   let connection;
   try {
     const pool = getPool(dbUrl);
     connection = await pool.getConnection();
 
-    const query = `
-      INSERT INTO students
-      (ssn_encrypted, student_name_ar, gender, gov_code, admin_zone, school_name, grade_level, class_name)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON DUPLICATE KEY UPDATE
-        student_name_ar = VALUES(student_name_ar),
-        gender          = VALUES(gender),
-        gov_code        = VALUES(gov_code),
-        admin_zone      = VALUES(admin_zone),
-        school_name     = VALUES(school_name),
-        grade_level     = VALUES(grade_level),
-        class_name      = VALUES(class_name)
-    `;
+    // Check if student exists
+    const [rows] = await connection.execute(
+      'SELECT student_id FROM test.students WHERE ssn_encrypted = ?', 
+      [ssn_encrypted]
+    );
 
-    const values = [
-      ssn_encrypted,
-      student_name_ar || null,
-      gender || null,
-      gov_code || null,
-      admin_zone || null,
-      school_name || null,
-      grade_level,
-      class_name || null,
-    ];
+    let affectedRows = 0;
 
-    const [result] = await connection.execute(query, values);
+    if (rows.length > 0) {
+      // Update existing
+      const [updateResult] = await connection.execute(
+        `UPDATE test.students 
+         SET student_name_ar = ?, gender = ?, gov_code = ?, admin_zone = ?, school_name = ?, grade_level = ?, class_name = ?
+         WHERE ssn_encrypted = ?`,
+        [student_name_ar || null, gender || null, numericGovCode, admin_zone || null, school_name || null, grade_level, class_name || null, ssn_encrypted]
+      );
+      affectedRows = updateResult.affectedRows;
+    } else {
+      // Insert new
+      const [insertResult] = await connection.execute(
+        `INSERT INTO test.students 
+         (ssn_encrypted, student_name_ar, gender, gov_code, admin_zone, school_name, grade_level, class_name)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [ssn_encrypted, student_name_ar || null, gender || null, numericGovCode, admin_zone || null, school_name || null, grade_level, class_name || null]
+      );
+      affectedRows = insertResult.affectedRows;
+    }
 
     return {
       statusCode: 200,
       headers,
       body: JSON.stringify({
         message: 'Student saved successfully',
-        affectedRows: result.affectedRows,
+        affectedRows: affectedRows,
       }),
     };
   } catch (error) {
