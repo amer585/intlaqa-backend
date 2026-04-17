@@ -1,0 +1,20 @@
+name: Deploy to Gigalixir
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: Deploy to Gigalixir
+        uses: mhanberg/gigalixir-action@v0.6.0
+        with:
+          GIGALIXIR_USERNAME: ${{ secrets.GIGALIXIR_EMAIL }}
+          GIGALIXIR_PASSWORD: ${{ secrets.GIGALIXIR_API_KEY }}
+          GIGALIXIR_APP: madrastna-backend
