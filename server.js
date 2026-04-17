@@ -8,7 +8,7 @@ app.use(cors());
 app.use(express.json());
 
 // ─────────────────────────────────────────────────────────
-// CONNECTION POOL CACHE
+// CONNECTION POOL CACHE (optimized for Back4App 256MB RAM)
 // ─────────────────────────────────────────────────────────
 const pools = {};
 
@@ -19,7 +19,7 @@ function getPool(dbUrl) {
       uri: dbUrl,
       ssl: { rejectUnauthorized: true },
       waitForConnections: true,
-      connectionLimit: 1, // Optimal for Serverless/Gigalixir free tier
+      connectionLimit: 1,
       maxIdle: 1,
       idleTimeout: 60000,
       enableKeepAlive: true,
@@ -48,6 +48,12 @@ const GOVERNORATES = [
 // ROUTES
 // ─────────────────────────────────────────────────────────
 
+// Health check
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', service: 'Madrastna Backend API', timestamp: new Date().toISOString() });
+});
+
+// ── Student Login ────────────────────────────────────────
 app.post('/api/studentLogin', async (req, res) => {
   const { ssn_encrypted, grade_level } = req.body;
 
@@ -103,6 +109,7 @@ app.post('/api/studentLogin', async (req, res) => {
   }
 });
 
+// ── Add / Update Student ─────────────────────────────────
 app.post('/api/addStudent', async (req, res) => {
   const { ssn_encrypted, student_name_ar, gender, gov_code, admin_zone, school_name, grade_level, class_name } = req.body;
 
@@ -153,6 +160,7 @@ app.post('/api/addStudent', async (req, res) => {
   }
 });
 
+// ── Log Actions ──────────────────────────────────────────
 app.post('/api/logAction', async (req, res) => {
   const data = req.body;
   const actions = Array.isArray(data.actions) ? data.actions : [data];
@@ -208,14 +216,31 @@ app.post('/api/logAction', async (req, res) => {
   return res.status(200).json({ message: 'Actions logged', results });
 });
 
-app.get('/', (req, res) => {
-  res.send('Madrastna Backend API is running!');
-});
-
 // ─────────────────────────────────────────────────────────
-// SERVER INITIALIZATION
+// SERVER START + GRACEFUL SHUTDOWN
 // ─────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server listening on port ${PORT}`);
+
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log(`✅ Madrastna Backend running on port ${PORT}`);
 });
+
+// Graceful shutdown — close all DB pools when container stops
+async function shutdown(signal) {
+  console.log(`\n⏳ ${signal} received — shutting down gracefully...`);
+  server.close(async () => {
+    for (const [url, pool] of Object.entries(pools)) {
+      try {
+        await pool.end();
+        console.log(`  ✓ Closed pool for ${url.substring(0, 30)}...`);
+      } catch (err) {
+        console.error(`  ✗ Error closing pool: ${err.message}`);
+      }
+    }
+    console.log('👋 Server shut down cleanly.');
+    process.exit(0);
+  });
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

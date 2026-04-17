@@ -1,13 +1,13 @@
 {
   "name": "madrastna-backend",
   "version": "1.0.0",
-  "description": "Express backend for Madrastna on Gigalixir",
+  "description": "Express backend for Madrastna on Back4App Containers",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "engines": {
-    "node": "20.x"
+    "node": "18.x"
   },
   "dependencies": {
     "cors": "^2.8.5",
