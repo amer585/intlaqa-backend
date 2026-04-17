@@ -14,5 +14,6 @@ jobs:
           fetch-depth: 0
       - name: Deploy to Gigalixir
         run: |
-          git remote add gigalixir https://${{ secrets.GIGALIXIR_EMAIL }}:${{ secrets.GIGALIXIR_API_KEY }}@git.gigalixir.com/madrastna-backend.git
+          ENCODED_EMAIL=$(echo "${{ secrets.GIGALIXIR_EMAIL }}" | sed 's/@/%40/g')
+          git remote add gigalixir https://${ENCODED_EMAIL}:${{ secrets.GIGALIXIR_API_KEY }}@git.gigalixir.com/madrastna-backend.git
           git push gigalixir main -f
