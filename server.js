@@ -50,9 +50,9 @@ function getDbUrl(gradeLevel) {
 }
 
 const GOVERNORATES = [
-  "القاهرة", "الإسكندرية", "الجيزة", "القليوبية", "الدقهلية", "الشرقية", "الغربية", 
-  "المنوفية", "البحيرة", "كفر الشيخ", "دمياط", "بورسعيد", "الإسماعيلية", "السويس", 
-  "مطروح", "شمال سيناء", "جنوب سيناء", "بني سويف", "الفيوم", "المنيا", "أسيوط", 
+  "القاهرة", "الإسكندرية", "الجيزة", "القليوبية", "الدقهلية", "الشرقية", "الغربية",
+  "المنوفية", "البحيرة", "كفر الشيخ", "دمياط", "بورسعيد", "الإسماعيلية", "السويس",
+  "مطروح", "شمال سيناء", "جنوب سيناء", "بني سويف", "الفيوم", "المنيا", "أسيوط",
   "سوهاج", "قنا", "الأقصر", "أسوان", "البحر الأحمر", "الوادي الجديد"
 ];
 
@@ -156,7 +156,7 @@ app.post('/api/addStudent', async (req, res) => {
 
     if (rows.length > 0) {
       const [updateResult] = await connection.execute(
-        `UPDATE test.students 
+        `UPDATE test.students
          SET student_name_ar = ?, gender = ?, gov_code = ?, admin_zone = ?, school_name = ?, grade_level = ?, class_name = ?
          WHERE ssn_encrypted = ?`,
         [student_name_ar || null, gender || null, numericGovCode, admin_zone || null, school_name || null, grade_level, class_name || null, ssn_encrypted]
@@ -164,7 +164,7 @@ app.post('/api/addStudent', async (req, res) => {
       affectedRows = updateResult.affectedRows;
     } else {
       const [insertResult] = await connection.execute(
-        `INSERT INTO test.students 
+        `INSERT INTO test.students
          (ssn_encrypted, student_name_ar, gender, gov_code, admin_zone, school_name, grade_level, class_name)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         [ssn_encrypted, student_name_ar || null, gender || null, numericGovCode, admin_zone || null, school_name || null, grade_level, class_name || null]
