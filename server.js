@@ -62,6 +62,22 @@ function authenticateToken(req, res, next) {
   });
 }
 
+function normalizeRole(role) {
+  return String(role || '').trim().toLowerCase();
+}
+
+function isDistrictManagerRole(role) {
+  const normalizedRole = normalizeRole(role);
+  return (
+    normalizedRole === 'district' ||
+    normalizedRole === 'district_manager' ||
+    normalizedRole === 'district manager' ||
+    normalizedRole === 'directorate' ||
+    normalizedRole === 'directorate_manager' ||
+    normalizedRole === 'directorate manager'
+  );
+}
+
 // ─────────────────────────────────────────────────────────
 // 3. ENTERPRISE RBAC & STAFF ROUTES (For your new Flutter App)
 // Note: We use DB_PRIMARY as the master database for Staff logins.
@@ -186,6 +202,220 @@ app.get('/api/hierarchy/schools', authenticateToken, async (req, res) => {
   }
 });
 
+app.get('/api/hierarchy/students', authenticateToken, async (req, res) => {
+  const { school_name, grade_level, class_name } = req.query;
+  const { role, admin_zone, school_name: userSchoolName } = req.user;
+
+  if (!school_name || !grade_level || !class_name) {
+    return res.status(400).json({ error: 'school_name, grade_level, and class_name are required.' });
+  }
+
+  const dbUrl = getDbUrl(grade_level);
+  if (!dbUrl) return res.status(400).json({ error: `Invalid grade_level: ${grade_level}` });
+
+  const normalizedRole = normalizeRole(role);
+  if ((normalizedRole === 'principal' || normalizedRole === 'teacher') && school_name !== userSchoolName) {
+    return res.status(403).json({ error: 'Forbidden: You can only fetch students from your assigned school.' });
+  }
+
+  let connection;
+  try {
+    const pool = getPool(dbUrl);
+    connection = await pool.getConnection();
+
+    let query = `
+      SELECT
+        s.ssn_encrypted,
+        s.student_name_ar,
+        s.gender,
+        s.gov_code,
+        s.admin_zone,
+        s.school_name,
+        s.grade_level,
+        s.class_name,
+        sg.grade_id,
+        sg.subject_name,
+        sg.grade_value,
+        sg.teacher_id,
+        sg.updated_at
+      FROM test.students s
+      LEFT JOIN test.student_grades sg
+        ON sg.ssn_encrypted = s.ssn_encrypted
+      WHERE s.school_name = ?
+        AND s.grade_level = ?
+        AND s.class_name = ?`;
+    const params = [school_name, Number(grade_level), class_name];
+
+    if (isDistrictManagerRole(normalizedRole) && admin_zone && admin_zone !== 'ALL') {
+      query += ` AND s.admin_zone = ?`;
+      params.push(admin_zone);
+    }
+
+    query += ` ORDER BY s.student_name_ar ASC, sg.subject_name ASC`;
+
+    const [rows] = await connection.execute(query, params);
+    const studentsMap = new Map();
+
+    for (const row of rows) {
+      if (!studentsMap.has(row.ssn_encrypted)) {
+        studentsMap.set(row.ssn_encrypted, {
+          ssn_encrypted: row.ssn_encrypted,
+          student_name_ar: row.student_name_ar,
+          gender: row.gender,
+          gov_code: row.gov_code,
+          gov_name: GOVERNORATES[Number(row.gov_code) - 1] || row.gov_code || null,
+          admin_zone: row.admin_zone,
+          school_name: row.school_name,
+          grade_level: row.grade_level,
+          class_name: row.class_name,
+          grades: [],
+        });
+      }
+
+      if (row.subject_name) {
+        studentsMap.get(row.ssn_encrypted).grades.push({
+          grade_id: row.grade_id,
+          subject_name: row.subject_name,
+          grade_value: row.grade_value,
+          teacher_id: row.teacher_id,
+          updated_at: row.updated_at,
+        });
+      }
+    }
+
+    return res.status(200).json({ students: Array.from(studentsMap.values()) });
+  } catch (error) {
+    console.error('[Hierarchy Students Error]:', error.message);
+    return res.status(500).json({ error: 'Failed to fetch students', details: error.message });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+app.post('/api/grades/update', authenticateToken, async (req, res) => {
+  const { ssn_encrypted, grade_level, class_name, subject_name, grade_value } = req.body;
+
+  if (!ssn_encrypted || !grade_level || !class_name || !subject_name || grade_value === undefined || grade_value === null) {
+    return res.status(400).json({ error: 'ssn_encrypted, grade_level, class_name, subject_name, and grade_value are required.' });
+  }
+
+  if (!req.user.teacher_id) {
+    return res.status(403).json({ error: 'Forbidden: teacher_id is missing from the token.' });
+  }
+
+  const dbUrl = getDbUrl(grade_level);
+  if (!dbUrl) return res.status(400).json({ error: `Invalid grade_level: ${grade_level}` });
+
+  let primaryConnection;
+  let gradeConnection;
+
+  try {
+    const primaryPool = getPool(process.env.DB_PRIMARY);
+    primaryConnection = await primaryPool.getConnection();
+
+    const [assignmentRows] = await primaryConnection.execute(
+      `SELECT 1
+       FROM test.teacher_classes
+       WHERE teacher_id = ?
+         AND grade_level = ?
+         AND class_name = ?
+         AND subject_name = ?
+       LIMIT 1`,
+      [req.user.teacher_id, Number(grade_level), class_name, subject_name]
+    );
+
+    if (assignmentRows.length === 0) {
+      return res.status(403).json({ error: 'Forbidden: Teacher cannot edit grades for this subject/class.' });
+    }
+
+    const gradePool = getPool(dbUrl);
+    gradeConnection = await gradePool.getConnection();
+
+    const [studentRows] = await gradeConnection.execute(
+      `SELECT ssn_encrypted
+       FROM test.students
+       WHERE ssn_encrypted = ?
+         AND grade_level = ?
+         AND class_name = ?
+       LIMIT 1`,
+      [String(ssn_encrypted), Number(grade_level), class_name]
+    );
+
+    if (studentRows.length === 0) {
+      return res.status(404).json({ error: 'Student not found in the provided grade/class.' });
+    }
+
+    await gradeConnection.execute(
+      `INSERT INTO test.student_grades (ssn_encrypted, subject_name, grade_value, teacher_id)
+       VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         grade_value = ?,
+         teacher_id = ?,
+         updated_at = CURRENT_TIMESTAMP`,
+      [String(ssn_encrypted), subject_name, grade_value, req.user.teacher_id, grade_value, req.user.teacher_id]
+    );
+
+    return res.status(200).json({ message: 'Grade updated successfully.' });
+  } catch (error) {
+    console.error('[Grade Update Error]:', error.message);
+    return res.status(500).json({ error: 'Failed to update grade', details: error.message });
+  } finally {
+    if (gradeConnection) gradeConnection.release();
+    if (primaryConnection) primaryConnection.release();
+  }
+});
+
+app.post('/api/admin/add-teacher', authenticateToken, async (req, res) => {
+  if (normalizeRole(req.user.role) !== 'principal') {
+    return res.status(403).json({ error: 'Forbidden: Only principals can add teachers.' });
+  }
+
+  const { username, password, teacher_name_ar, gov_code, admin_zone } = req.body;
+
+  if (!username || !password) {
+    return res.status(400).json({ error: 'username and password are required.' });
+  }
+
+  if (!req.user.school_name || req.user.school_name === 'ALL') {
+    return res.status(403).json({ error: 'Forbidden: Principal school assignment is missing.' });
+  }
+
+  let connection;
+  try {
+    const pool = getPool(process.env.DB_PRIMARY);
+    connection = await pool.getConnection();
+
+    const saltRounds = 10;
+    const passwordHash = await bcrypt.hash(password, saltRounds);
+
+    const [result] = await connection.execute(
+      `INSERT INTO test.teachers
+       (username, password_hash, teacher_name_ar, role, gov_code, admin_zone, school_name)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        username,
+        passwordHash,
+        teacher_name_ar || username,
+        'teacher',
+        gov_code || null,
+        req.user.admin_zone || admin_zone || 'ALL',
+        req.user.school_name,
+      ]
+    );
+
+    return res.status(201).json({
+      message: 'Teacher created successfully.',
+      userId: result.insertId,
+      school_name: req.user.school_name,
+    });
+  } catch (error) {
+    console.error('[Add Teacher Error]:', error.message);
+    return res.status(500).json({ error: 'Failed to create teacher', details: error.message });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
 
 // ─────────────────────────────────────────────────────────
 // 4. LEGACY STUDENT ROUTES (Kept exactly as you had them)
@@ -246,33 +476,54 @@ app.post('/api/studentLogin', async (req, res) => {
   }
 });
 
-app.post('/api/addStudent', async (req, res) => {
+function resolveGovCode(govCode) {
+  if (govCode === undefined || govCode === null || govCode === '') return 1;
+  if (/^\d+$/.test(String(govCode))) return Number(govCode);
+
+  const governorateIndex = GOVERNORATES.indexOf(govCode);
+  return governorateIndex >= 0 ? governorateIndex + 1 : 1;
+}
+
+app.post('/api/addStudent', authenticateToken, async (req, res) => {
   const { ssn_encrypted, student_name_ar, gender, gov_code, admin_zone, school_name, grade_level, class_name } = req.body;
   if (!ssn_encrypted || !grade_level) return res.status(400).json({ error: 'ssn_encrypted and grade_level are required' });
+
+  const normalizedRole = normalizeRole(req.user.role);
+  if (normalizedRole !== 'principal' && !isDistrictManagerRole(normalizedRole)) {
+    return res.status(403).json({ error: 'Forbidden: Only principals and district/directorate managers can add students.' });
+  }
+  if (normalizedRole === 'principal' && (!req.user.school_name || req.user.school_name === 'ALL')) {
+    return res.status(403).json({ error: 'Forbidden: Principal school assignment is missing.' });
+  }
 
   const dbUrl = getDbUrl(grade_level);
   if (!dbUrl) return res.status(400).json({ error: `Invalid grade_level: ${grade_level}.` });
 
-  let numericGovCode = GOVERNORATES.indexOf(gov_code) + 1;
-  if (numericGovCode === 0) numericGovCode = 1;
+  const numericGovCode = resolveGovCode(gov_code);
+  const effectiveSchoolName = normalizedRole === 'principal' ? req.user.school_name : (school_name || null);
+  const effectiveAdminZone = normalizedRole === 'principal'
+    ? (req.user.admin_zone || admin_zone || null)
+    : (isDistrictManagerRole(normalizedRole) && req.user.admin_zone && req.user.admin_zone !== 'ALL'
+      ? req.user.admin_zone
+      : (admin_zone || null));
 
   let connection;
   try {
     const pool = getPool(dbUrl);
     connection = await pool.getConnection();
-    const [rows] = await connection.execute('SELECT student_id FROM test.students WHERE ssn_encrypted = ?', [ssn_encrypted]);
+    const [rows] = await connection.execute('SELECT ssn_encrypted FROM test.students WHERE ssn_encrypted = ?', [ssn_encrypted]);
     
     let affectedRows = 0;
     if (rows.length > 0) {
       const [updateResult] = await connection.execute(
         `UPDATE test.students SET student_name_ar = ?, gender = ?, gov_code = ?, admin_zone = ?, school_name = ?, grade_level = ?, class_name = ? WHERE ssn_encrypted = ?`,
-        [student_name_ar || null, gender || null, numericGovCode, admin_zone || null, school_name || null, grade_level, class_name || null, ssn_encrypted]
+        [student_name_ar || null, gender || null, numericGovCode, effectiveAdminZone, effectiveSchoolName, grade_level, class_name || null, ssn_encrypted]
       );
       affectedRows = updateResult.affectedRows;
     } else {
       const [insertResult] = await connection.execute(
         `INSERT INTO test.students (ssn_encrypted, student_name_ar, gender, gov_code, admin_zone, school_name, grade_level, class_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [ssn_encrypted, student_name_ar || null, gender || null, numericGovCode, admin_zone || null, school_name || null, grade_level, class_name || null]
+        [ssn_encrypted, student_name_ar || null, gender || null, numericGovCode, effectiveAdminZone, effectiveSchoolName, grade_level, class_name || null]
       );
       affectedRows = insertResult.affectedRows;
     }
