@@ -28,6 +28,42 @@ CREATE TABLE IF NOT EXISTS students (
   -- All lookups by SSN are O(1). No secondary index needed.
 );
 
+CREATE INDEX IF NOT EXISTS idx_class_lookup
+  ON students (school_name, grade_level, class_name, admin_zone);
+
+-- ─────────────────────────────────────────────────────────
+-- 1B. STUDENT GRADES TABLE
+--     Scoped by student, grade level, and class to keep
+--     roster joins bounded to the active class only.
+-- ─────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS student_grades (
+  grade_id         BIGINT        NOT NULL AUTO_INCREMENT,
+  ssn_encrypted    VARCHAR(14)   NOT NULL,
+  grade_level      TINYINT       NOT NULL,
+  class_name       VARCHAR(30)   NOT NULL,
+  subject_name     VARCHAR(100)  NOT NULL,
+  grade_value      VARCHAR(50)   DEFAULT NULL,
+  teacher_id       BIGINT        DEFAULT NULL,
+  created_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  PRIMARY KEY (grade_id),
+  UNIQUE KEY uq_student_grade_scope (ssn_encrypted, grade_level, class_name, subject_name),
+  INDEX idx_grade_roster_lookup (grade_level, class_name, ssn_encrypted)
+);
+
+ALTER TABLE student_grades
+  ADD COLUMN IF NOT EXISTS grade_level TINYINT NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS class_name VARCHAR(30) NOT NULL DEFAULT '';
+
+-- If your existing table still has a legacy student+subject unique key,
+-- drop it before applying the scoped unique index below.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_student_grade_scope
+  ON student_grades (ssn_encrypted, grade_level, class_name, subject_name);
+
+CREATE INDEX IF NOT EXISTS idx_grade_roster_lookup
+  ON student_grades (grade_level, class_name, ssn_encrypted);
+
 
 -- ─────────────────────────────────────────────────────────
 -- 2. ACTIVITY LOGS TABLE

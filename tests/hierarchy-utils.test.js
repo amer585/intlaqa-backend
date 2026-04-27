@@ -1,22 +1,35 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { filterSchoolsForUser, mapStudentsWithGrades } = require('../src/utils/hierarchy');
+const {
+  filterSchoolsForUser,
+  mapJoinedStudentsWithGrades,
+  mapStudentsWithGrades,
+} = require('../src/utils/hierarchy');
 
 test('school filtering keeps only the relevant schools for district and school-scoped users', () => {
   const schools = [
-    { school_name: 'A', admin_zone: 'Z1' },
-    { school_name: 'B', admin_zone: 'Z2' },
+    { school_name: 'A', admin_zone: 'Z1', gov_code: 1 },
+    { school_name: 'B', admin_zone: 'Z2', gov_code: 2 },
+    { school_name: 'C', admin_zone: 'Z3', gov_code: 1 },
   ];
 
   assert.deepEqual(
     filterSchoolsForUser(schools, { role: 'district', admin_zone: 'Z1' }),
-    [{ school_name: 'A', admin_zone: 'Z1' }]
+    [{ school_name: 'A', admin_zone: 'Z1', gov_code: 1 }]
+  );
+
+  assert.deepEqual(
+    filterSchoolsForUser(schools, { role: 'directorate_manager', gov_code: 1 }),
+    [
+      { school_name: 'A', admin_zone: 'Z1', gov_code: 1 },
+      { school_name: 'C', admin_zone: 'Z3', gov_code: 1 },
+    ]
   );
 
   assert.deepEqual(
     filterSchoolsForUser(schools, { role: 'teacher', school_name: 'B' }),
-    [{ school_name: 'B', admin_zone: 'Z2' }]
+    [{ school_name: 'B', admin_zone: 'Z2', gov_code: 2 }]
   );
 });
 
@@ -60,4 +73,46 @@ test('student-grade mapper avoids duplicated student payloads while preserving g
   assert.equal(result[0].school_name, 'School A');
   assert.equal(result[0].grades.length, 2);
   assert.equal(result[0].grades[1].subject_name, 'Science');
+});
+
+test('joined student-grade mapper keeps one student row and only appends non-null grades', () => {
+  const rows = [
+    {
+      ssn_encrypted: '11111111111111',
+      student_name_ar: 'Student One',
+      gender: 'F',
+      gov_code: 1,
+      admin_zone: 'Zone A',
+      school_name: 'School A',
+      grade_level: 5,
+      class_name: '5A',
+      grade_id: 1,
+      subject_name: 'Math',
+      grade_value: 95,
+      teacher_id: 10,
+      updated_at: '2026-01-01T00:00:00.000Z',
+    },
+    {
+      ssn_encrypted: '11111111111111',
+      student_name_ar: 'Student One',
+      gender: 'F',
+      gov_code: 1,
+      admin_zone: 'Zone A',
+      school_name: 'School A',
+      grade_level: 5,
+      class_name: '5A',
+      grade_id: null,
+      subject_name: null,
+      grade_value: null,
+      teacher_id: null,
+      updated_at: null,
+    },
+  ];
+
+  const result = mapJoinedStudentsWithGrades(rows);
+
+  assert.equal(result.length, 1);
+  assert.equal(result[0].gov_name, 'القاهرة');
+  assert.equal(result[0].grades.length, 1);
+  assert.equal(result[0].grades[0].subject_name, 'Math');
 });

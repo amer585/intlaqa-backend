@@ -47,38 +47,41 @@ async function updateGrade(payload, user) {
       throw new AppError(403, 'Forbidden: Teacher cannot edit grades for this subject/class.');
     }
 
-    await withConnection(dbUrl, async (connection) => {
-      const [studentRows] = await connection.execute(
-        `SELECT 1
-         FROM test.students
-         WHERE ssn_encrypted = ?
-           AND grade_level = ?
-           AND class_name = ?
-         LIMIT 1`,
-        [String(payload.ssn_encrypted), numericGradeLevel, payload.class_name]
-      );
+      await withConnection(dbUrl, async (connection) => {
+        const [studentRows] = await connection.execute(
+          `SELECT 1
+           FROM test.students
+           WHERE ssn_encrypted = ?
+             AND grade_level = ?
+             AND class_name = ?
+           LIMIT 1`,
+          [String(payload.ssn_encrypted), numericGradeLevel, payload.class_name]
+        );
 
-      if (studentRows.length === 0) {
-        throw new AppError(404, 'Student not found in the provided grade/class.');
-      }
+        if (studentRows.length === 0) {
+          throw new AppError(404, 'Student not found in the provided grade/class.');
+        }
 
-      await connection.execute(
-        `INSERT INTO test.student_grades (ssn_encrypted, subject_name, grade_value, teacher_id)
-         VALUES (?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE
-           grade_value = ?,
-           teacher_id = ?,
-           updated_at = CURRENT_TIMESTAMP`,
-        [
-          String(payload.ssn_encrypted),
-          payload.subject_name,
-          payload.grade_value,
-          user.teacher_id,
-          payload.grade_value,
-          user.teacher_id,
-        ]
-      );
-    });
+        await connection.execute(
+          `INSERT INTO test.student_grades
+           (ssn_encrypted, grade_level, class_name, subject_name, grade_value, teacher_id)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE
+             grade_value = ?,
+             teacher_id = ?,
+            updated_at = CURRENT_TIMESTAMP`,
+          [
+            String(payload.ssn_encrypted),
+            numericGradeLevel,
+            payload.class_name,
+            payload.subject_name,
+            payload.grade_value,
+            user.teacher_id,
+            payload.grade_value,
+            user.teacher_id,
+          ]
+        );
+      });
 
     return { message: 'Grade updated successfully.' };
   } catch (error) {

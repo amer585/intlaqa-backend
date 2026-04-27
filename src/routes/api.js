@@ -4,7 +4,12 @@ const asyncHandler = require('../lib/asyncHandler');
 const authenticateToken = require('../middleware/authenticateToken');
 const { loginStaff } = require('../services/authService');
 const { registerStaff, addTeacher } = require('../services/staffService');
-const { getSchoolsForUser, getStudentsForHierarchy } = require('../services/hierarchyService');
+const {
+  getClassesForHierarchy,
+  getDistrictsForUser,
+  getSchoolsForUser,
+  getStudentsForHierarchy,
+} = require('../services/hierarchyService');
 const { updateGrade } = require('../services/gradeService');
 const { loginStudent, saveStudent } = require('../services/studentService');
 const { logActions } = require('../services/activityService');
@@ -23,8 +28,18 @@ function createApiRouter() {
   }));
 
   router.get('/hierarchy/schools', authenticateToken, asyncHandler(async (req, res) => {
-    const schools = await getSchoolsForUser(req.user);
+    const schools = await getSchoolsForUser(req.user, req.query);
     res.status(200).json({ schools });
+  }));
+
+  router.get('/hierarchy/districts', authenticateToken, asyncHandler(async (req, res) => {
+    const districts = await getDistrictsForUser(req.user);
+    res.status(200).json({ districts });
+  }));
+
+  router.get('/hierarchy/classes', authenticateToken, asyncHandler(async (req, res) => {
+    const classes = await getClassesForHierarchy(req.query, req.user);
+    res.status(200).json({ classes });
   }));
 
   router.get('/hierarchy/students', authenticateToken, asyncHandler(async (req, res) => {

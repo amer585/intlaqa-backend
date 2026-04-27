@@ -15,7 +15,7 @@ async function loginStaff(payload = {}) {
   try {
     return await withConnection(config.dbUrls.primary, async (connection) => {
       const [rows] = await connection.execute(
-        `SELECT teacher_id, teacher_name_ar, role, admin_zone, school_name, password_hash
+        `SELECT teacher_id, teacher_name_ar, role, gov_code, admin_zone, school_name, password_hash
          FROM test.teachers
          WHERE username = ? AND is_active = TRUE
          LIMIT 1`,
@@ -36,6 +36,7 @@ async function loginStaff(payload = {}) {
       const token = jwt.sign(
         {
           teacher_id: user.teacher_id,
+          gov_code: user.gov_code,
           role: user.role,
           admin_zone: user.admin_zone,
           school_name: user.school_name,
@@ -48,8 +49,10 @@ async function loginStaff(payload = {}) {
         success: true,
         token,
         user: {
+          name: user.teacher_name_ar,
           teacher_name_ar: user.teacher_name_ar,
           role: user.role,
+          gov_code: user.gov_code,
           admin_zone: user.admin_zone,
           school_name: user.school_name,
         },
