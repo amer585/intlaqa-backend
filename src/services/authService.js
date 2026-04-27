@@ -13,7 +13,11 @@ async function loginStaff(payload = {}) {
   }
 
   try {
-    const targetDb = config.dbUrls.teachers || config.dbUrls.primary;
+    const targetDb = config.dbUrls.teachers;
+    if (!targetDb) {
+      throw new AppError(500, 'Server Misconfiguration: DB_TEACHER environment variable is missing.');
+    }
+    
     return await withConnection(targetDb, async (connection) => {
       const [rows] = await connection.execute(
         `SELECT teacher_id, teacher_name_ar, role, gov_code, admin_zone, school_name, password_hash
