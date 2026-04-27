@@ -12,6 +12,7 @@ const config = Object.freeze({
     primary: process.env.DB_PRIMARY || null,
     prep: process.env.DB_PREP || null,
     secondary: process.env.DB_SECONDARY || null,
+    teachers: process.env.DB_TEACHER || null,
   }),
   pool: Object.freeze({
     waitForConnections: true,

@@ -22,7 +22,7 @@ async function registerStaff(payload) {
   try {
     const passwordHash = await bcrypt.hash(password, 10);
 
-    return await withConnection(config.dbUrls.primary, async (connection) => {
+    return await withConnection(config.dbUrls.teachers, async (connection) => {
       const [result] = await connection.execute(
         `INSERT INTO test.teachers
          (username, password_hash, teacher_name_ar, role, gov_code, admin_zone, school_name)
@@ -68,7 +68,7 @@ async function addTeacher(payload, user) {
   try {
     const passwordHash = await bcrypt.hash(password, 10);
 
-    return await withConnection(config.dbUrls.primary, async (connection) => {
+    return await withConnection(config.dbUrls.teachers, async (connection) => {
       const [result] = await connection.execute(
         `INSERT INTO test.teachers
          (username, password_hash, teacher_name_ar, role, gov_code, admin_zone, school_name)

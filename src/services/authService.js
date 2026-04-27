@@ -13,7 +13,8 @@ async function loginStaff(payload = {}) {
   }
 
   try {
-    return await withConnection(config.dbUrls.primary, async (connection) => {
+    const targetDb = config.dbUrls.teachers || config.dbUrls.primary;
+    return await withConnection(targetDb, async (connection) => {
       const [rows] = await connection.execute(
         `SELECT teacher_id, teacher_name_ar, role, gov_code, admin_zone, school_name, password_hash
          FROM test.teachers
@@ -27,7 +28,10 @@ async function loginStaff(payload = {}) {
       }
 
       const user = rows[0];
-      const validPassword = await bcrypt.compare(password, user.password_hash);
+      const isHashed = user.password_hash && (user.password_hash.startsWith('$2a$') || user.password_hash.startsWith('$2b$'));
+      const validPassword = isHashed 
+        ? await bcrypt.compare(password, user.password_hash)
+        : password === user.password_hash;
 
       if (!validPassword) {
         throw new AppError(401, 'Invalid username or password');

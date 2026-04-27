@@ -30,7 +30,7 @@ async function loadSchools() {
   }
 
   try {
-    const schools = await withConnection(config.dbUrls.primary, async (connection) => {
+    const schools = await withConnection(config.dbUrls.teachers, async (connection) => {
       const [rows] = await connection.execute(
         `SELECT DISTINCT school_name, admin_zone, gov_code
          FROM test.teachers
