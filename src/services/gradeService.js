@@ -71,7 +71,7 @@ async function updateGrade(payload, user) {
         );
 
         if (studentRows.length === 0) {
-          throw new AppError(404, \`Student \${grade.ssn_encrypted} not found in the provided grade/class.\`);
+          throw new AppError(404, `Student ${grade.ssn_encrypted} not found in the provided grade/class.`);
         }
 
         await connection.execute(
