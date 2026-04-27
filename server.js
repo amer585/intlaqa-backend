@@ -13,11 +13,13 @@ app.use(express.json());
 // 1. GLOBAL CONFIGURATION & DATABASE POOLS
 // ─────────────────────────────────────────────────────────
 const JWT_SECRET = process.env.JWT_SECRET || 'madrastna-super-secret-key-2026';
+const SCHOOL_CACHE_TTL_MS = 30 * 60 * 1000;
 
 process.on('uncaughtException', (err) => console.error('⚠️ Uncaught Exception:', err.message));
 process.on('unhandledRejection', (err) => console.error('⚠️ Unhandled Rejection:', err));
 
 const pools = {};
+let schoolCache = { data: null, lastFetched: 0 };
 
 function getPool(dbUrl) {
   if (!dbUrl) throw new Error('Database URL is undefined.');
@@ -28,7 +30,7 @@ function getPool(dbUrl) {
       ssl: { rejectUnauthorized: true },
       waitForConnections: true,
       connectionLimit: 5, // Increased for better performance
-      maxIdle: 5,
+      maxIdle: 2,
       idleTimeout: 60000,
       enableKeepAlive: true,
       keepAliveInitialDelay: 10000,
@@ -149,7 +151,7 @@ app.post('/api/login', async (req, res) => {
         school_name: user.school_name 
       },
       JWT_SECRET,
-      { expiresIn: '12h' } // Token expires in 12 hours
+      { expiresIn: '7d' } // Token expires in 7 days
     );
 
     return res.status(200).json({
@@ -173,25 +175,45 @@ app.post('/api/login', async (req, res) => {
 // 📁 GET DATA HIERARCHY (Requires JWT Token)
 app.get('/api/hierarchy/schools', authenticateToken, async (req, res) => {
   const { role, admin_zone, school_name } = req.user;
+  const now = Date.now();
+  const cachedSchools = schoolCache.data;
+
+  if (cachedSchools && (now - schoolCache.lastFetched) < SCHOOL_CACHE_TTL_MS) {
+    let schools = cachedSchools;
+
+    if (role === 'district') {
+      schools = schools.filter((school) => school.admin_zone === admin_zone);
+    } else if (role === 'principal' || role === 'teacher') {
+      schools = schools.filter((school) => school.school_name === school_name);
+    }
+
+    return res.status(200).json({ schools });
+  }
+
   let connection;
 
   try {
     const pool = getPool(process.env.DB_PRIMARY);
     connection = await pool.getConnection();
 
-    let query = `SELECT DISTINCT school_name, admin_zone FROM test.teachers WHERE school_name != 'ALL'`;
-    let params = [];
+    const [allSchools] = await connection.execute(
+      `SELECT DISTINCT school_name, admin_zone
+       FROM test.teachers
+       WHERE school_name != 'ALL'`
+    );
 
-    // Filter based on RBAC rules!
+    schoolCache = {
+      data: allSchools,
+      lastFetched: now,
+    };
+
+    let schools = allSchools;
     if (role === 'district') {
-      query += ` AND admin_zone = ?`;
-      params.push(admin_zone);
+      schools = schools.filter((school) => school.admin_zone === admin_zone);
     } else if (role === 'principal' || role === 'teacher') {
-      query += ` AND school_name = ?`;
-      params.push(school_name);
+      schools = schools.filter((school) => school.school_name === school_name);
     }
 
-    const [schools] = await connection.execute(query, params);
     res.status(200).json({ schools });
 
   } catch (error) {
@@ -212,6 +234,7 @@ app.get('/api/hierarchy/students', authenticateToken, async (req, res) => {
 
   const dbUrl = getDbUrl(grade_level);
   if (!dbUrl) return res.status(400).json({ error: `Invalid grade_level: ${grade_level}` });
+  const numericGradeLevel = Number(grade_level);
 
   const normalizedRole = normalizeRole(role);
   if ((normalizedRole === 'principal' || normalizedRole === 'teacher') && school_name !== userSchoolName) {
@@ -230,9 +253,6 @@ app.get('/api/hierarchy/students', authenticateToken, async (req, res) => {
         s.gender,
         s.gov_code,
         s.admin_zone,
-        s.school_name,
-        s.grade_level,
-        s.class_name,
         sg.grade_id,
         sg.subject_name,
         sg.grade_value,
@@ -244,7 +264,7 @@ app.get('/api/hierarchy/students', authenticateToken, async (req, res) => {
       WHERE s.school_name = ?
         AND s.grade_level = ?
         AND s.class_name = ?`;
-    const params = [school_name, Number(grade_level), class_name];
+    const params = [school_name, numericGradeLevel, class_name];
 
     if (isDistrictManagerRole(normalizedRole) && admin_zone && admin_zone !== 'ALL') {
       query += ` AND s.admin_zone = ?`;
@@ -265,9 +285,9 @@ app.get('/api/hierarchy/students', authenticateToken, async (req, res) => {
           gov_code: row.gov_code,
           gov_name: GOVERNORATES[Number(row.gov_code) - 1] || row.gov_code || null,
           admin_zone: row.admin_zone,
-          school_name: row.school_name,
-          grade_level: row.grade_level,
-          class_name: row.class_name,
+          school_name,
+          grade_level: numericGradeLevel,
+          class_name,
           grades: [],
         });
       }
