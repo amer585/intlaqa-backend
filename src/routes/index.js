@@ -67,6 +67,11 @@ function createApiRouter() {
     res.status(200).json(await logActions(req.body));
   }));
 
+  // ---- Student portal (full data: grades, attendance, schedule, announcements) ----
+  router.get('/student/portal', asyncHandler(async (req, res) => {
+    res.status(200).json(await getStudentPortal(req.query));
+  }));
+
   return router;
 }
 
