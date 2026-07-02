@@ -2,7 +2,8 @@
 
 const { createApp } = require('./app');
 const { config } = require('./config/env');
-const { closeAllPools } = require('./db/pools');
+const { getPool, closeAllPools } = require('./db/pools');
+const { runMigrations } = require('./db/migrate');
 const logger = require('./lib/logger');
 
 // Never let an unhandled error kill the process silently.
@@ -13,7 +14,19 @@ process.on('unhandledRejection', (reason) => {
   logger.error('Unhandled rejection', { reason: String(reason) });
 });
 
-function startServer() {
+async function startServer() {
+  // Auto-create tables on boot (idempotent) so a fresh DB just works.
+  try {
+    const client = await getPool().connect();
+    try {
+      await runMigrations(client);
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    logger.error('Schema migration failed — continuing anyway', { message: error.message });
+  }
+
   const app = createApp();
   const server = app.listen(config.port, '0.0.0.0', () => {
     logger.info(`Intlaqa backend listening on 0.0.0.0:${config.port} (${config.env})`);
