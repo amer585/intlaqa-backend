@@ -22,26 +22,37 @@ function createApp() {
   app.use(express.json({ limit: '1mb' }));
   app.use(apiRateLimiter);
 
+  // ALWAYS responds — proves the server is alive regardless of DB state.
   app.get('/', (_req, res) => {
     res.json({
       status: 'ok',
       service: 'Intlaqa / Madrastna API v3',
-      db: 'postgresql (single)',
+      db: config.dbAvailable ? 'configured' : 'NOT CONFIGURED',
       cache: redisEnabled ? 'redis' : 'disabled',
+      trial_login: config.allowTestLogin,
+      jwt_secret: config.jwtSecretFallback ? 'fallback (ephemeral)' : 'configured',
       time: new Date().toISOString(),
     });
   });
 
   app.get('/health', async (_req, res) => {
-    const [db, cache] = await Promise.all([pingDatabase(), redisPing()]);
-    const dbOk = db.ok;
-    const cacheOk = !cache.enabled || cache.ok; // disabled cache is fine
-    const allOk = dbOk && cacheOk;
-    res.status(allOk ? 200 : 503).json({
+    let db = { ok: false, error: 'DATABASE_URL not configured' };
+    if (config.dbAvailable) {
+      db = await pingDatabase();
+    }
+    const cache = await redisPing();
+    const cacheOk = !cache.enabled || cache.ok;
+    // The server is "ok" if it's listening. DB-down is "degraded" not "down".
+    const allOk = db.ok && cacheOk;
+    res.status(200).json({
       status: allOk ? 'ok' : 'degraded',
       uptime: process.uptime(),
       database: db,
       cache,
+      warnings: {
+        noDb: !config.dbAvailable,
+        jwtFallback: config.jwtSecretFallback,
+      },
     });
   });
 

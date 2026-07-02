@@ -39,7 +39,12 @@ async function loginStudent(payload = {}) {
   }
 
   const dbUrl = getDbUrl(gradeLevel);
-  if (!dbUrl) throw new AppError(400, `Invalid grade_level: ${payload.grade_level}`);
+  if (!dbUrl) {
+    if (!config.dbAvailable) {
+      throw new AppError(503, 'قاعدة البيانات غير متاحة حالياً. حاول الدخول التجريبي. (Database not configured)');
+    }
+    throw new AppError(400, `Invalid grade_level: ${payload.grade_level}`);
+  }
 
   // ── Cache-aside: try Redis first ──
   const cacheKey = `student:${gradeLevel}:${ssn}`;

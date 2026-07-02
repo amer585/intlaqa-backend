@@ -2,6 +2,8 @@
 
 require('dotenv').config();
 
+const crypto = require('crypto');
+
 const DEFAULT_PORT = 7860; // Hugging Face Spaces requirement
 const DEFAULT_JWT_EXPIRES_IN = '7d';
 const DEFAULT_RATE_LIMIT_MAX = 300;
@@ -19,15 +21,17 @@ function parseList(raw) {
 }
 
 // ── Database (single PostgreSQL) ──────────────────────────────
-const databaseUrl = process.env.DATABASE_URL;
-if (!databaseUrl) {
-  throw new Error('FATAL: DATABASE_URL is required (postgres://user:pass@host:port/db).');
-}
+// NEVER throw — if DATABASE_URL is missing, mark db as unavailable and keep booting.
+const databaseUrl = process.env.DATABASE_URL || null;
+const dbAvailable = Boolean(databaseUrl);
 
 // ── JWT ───────────────────────────────────────────────────────
-const jwtSecret = process.env.JWT_SECRET;
+// NEVER throw — generate a random fallback if missing/weak so the server boots.
+let jwtSecret = process.env.JWT_SECRET;
+let jwtSecretFallback = false;
 if (!jwtSecret || jwtSecret.length < 16 || jwtSecret === 'change-me-to-a-long-random-string') {
-  throw new Error('FATAL: JWT_SECRET is missing or too weak. Use `openssl rand -hex 48`.');
+  jwtSecret = crypto.randomBytes(48).toString('hex');
+  jwtSecretFallback = true;
 }
 
 const config = Object.freeze({
@@ -36,12 +40,12 @@ const config = Object.freeze({
   trustProxy: String(process.env.TRUST_PROXY ?? 'true') === 'true',
 
   jwtSecret,
+  jwtSecretFallback,
   jwtExpiresIn: process.env.JWT_EXPIRES_IN || DEFAULT_JWT_EXPIRES_IN,
   corsOrigins: parseList(process.env.CORS_ORIGINS),
 
-  // Single PostgreSQL database for everything (grades 1-12 + staff).
-  // Sharding across 4 DBs can be reintroduced later by routing getDbUrl().
   databaseUrl,
+  dbAvailable,
   schema: process.env.PG_SCHEMA || 'public',
   sslMode: (process.env.DB_SSL_MODE || 'require').toLowerCase(),
   sslCaPath: process.env.DB_SSL_CA_PATH || null,
@@ -51,7 +55,6 @@ const config = Object.freeze({
     connectionTimeoutMillis: 10000,
   }),
 
-  // Upstash Redis (REST API). Disabled if either value is blank.
   upstashRedisUrl: process.env.UPSTASH_REDIS_REST_URL || null,
   upstashRedisToken: process.env.UPSTASH_REDIS_REST_TOKEN || null,
   redisTtlSec: parseIntEnv(process.env.REDIS_TTL_SEC, 300),
@@ -62,13 +65,10 @@ const config = Object.freeze({
 });
 
 /**
- * Map a grade level (1-12) to a database URL. With a single DB this always
- * returns the same URL for valid grades — keeping the routing seam so we can
- * split into 4 databases later without touching call sites.
- * @param {number|string} gradeLevel
- * @returns {string|null}
+ * Map a grade level (1-12) to the database URL. Returns null if DB unavailable.
  */
 function getDbUrl(gradeLevel) {
+  if (!config.dbAvailable) return null;
   const grade = Number(gradeLevel);
   if (grade >= 1 && grade <= 12) return config.databaseUrl;
   return null;

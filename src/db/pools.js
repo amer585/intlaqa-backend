@@ -10,6 +10,9 @@ let pool = null;
 
 /** Lazily create the single PostgreSQL connection pool. */
 function getPool() {
+  if (!config.dbAvailable) {
+    throw new Error('DATABASE_URL is not configured — database features unavailable.');
+  }
   if (!pool) {
     const ssl = buildSslOptions();
     pool = new Pool({
