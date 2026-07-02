@@ -45,6 +45,11 @@ jobs:
             exit 1
           fi
 
+          # Strip ANY leading/trailing whitespace, tabs, or newlines that may
+          # have been pasted into the HF_SPACE value (fixes "Malformed input
+          # to a URL function" caused by a stray tab character).
+          HF_SPACE="$(printf '%s' "$HF_SPACE" | tr -d '[:space:]')"
+
           echo "✓ HF_TOKEN present"
           echo "✓ Target Space: ${HF_SPACE}"
           echo "→ Pushing to Hugging Face..."
