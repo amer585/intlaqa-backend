@@ -29,21 +29,14 @@ jobs:
       - name: Push to Hugging Face Space
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          # HF_SPACE is read from Variable OR Secret, falling back to amer21/mcp.
-          # Put it in whichever tab you like — it will still work.
-          HF_SPACE: ${{ vars.HF_SPACE || secrets.HF_SPACE || 'amer21/mcp' }}
+          HF_SPACE: ${{ vars.HF_SPACE }}
         run: |
-          # Strip any stray whitespace (tabs/spaces/newlines) from pasted values.
-          HF_TOKEN="$(printf '%s' "$HF_TOKEN" | tr -d '[:space:]')"
-          HF_SPACE="$(printf '%s' "$HF_SPACE" | tr -d '[:space:]')"
-          if [ -z "$HF_TOKEN" ]; then
-            echo "FATAL: HF_TOKEN secret is not set. Add it in Settings > Secrets and variables > Actions."
+          if [ -z "$HF_TOKEN" ] || [ -z "$HF_SPACE" ]; then
+            echo "Set HF_TOKEN (secret) and HF_SPACE (variable, e.g. amer21/mcp) in the repo settings."
             exit 1
           fi
-          echo "Deploying to Hugging Face Space: $HF_SPACE"
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add space "https://amer585:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE}" || \
             git remote set-url space "https://amer585:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE}"
           git push -f space main
-          echo "✓ Pushed to https://huggingface.co/spaces/$HF_SPACE"

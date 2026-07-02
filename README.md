@@ -1,13 +1,3 @@
----
-title: Intlaqa Backend
-emoji: 📚
-colorFrom: green
-colorTo: blue
-sdk: docker
-app_port: 7860
-pinned: false
----
-
 # Intlaqa / Madrastna — Backend v3 (PostgreSQL + Redis + Hugging Face)
 
 Hardened Express backend for the school-management system. Same API contract
