@@ -6,7 +6,9 @@ const { assert14DigitSsn, assertGradeLevel } = require('../utils/validation');
 
 /**
  * Fetch the full student portal: profile, grades, attendance, schedule,
- * and announcements — all from real database data.
+ * and announcements. Each section is queried independently with try/catch so
+ * a single failing query NEVER causes a 500 — it just returns empty for that
+ * section. The profile is the only hard requirement.
  *
  * @param {{ ssn_encrypted?: string, grade_level?: number }} query
  */
@@ -16,88 +18,79 @@ async function getStudentPortal(query = {}) {
   const gradeLevel = assertGradeLevel(query.grade_level);
   const ssn = String(query.ssn_encrypted);
 
+  // 1. Profile — the only hard requirement.
+  let profileRes;
   try {
-    // Run all independent queries in parallel for speed.
-    const [profileRes, gradesRes, attendanceRes, scheduleRes, announcementsRes] = await Promise.all([
-      // 1. Student profile
-      getClient().execute({
-        sql: `SELECT ssn_encrypted, student_name_ar, gender, gov_code, admin_zone, school_name, grade_level, class_name
-                FROM students WHERE ssn_encrypted = ? LIMIT 1`,
-        args: [ssn],
-      }),
-      // 2. All grades for this student
-      getClient().execute({
-        sql: `SELECT subject_name, grade_value, class_name, teacher_id, updated_at
-                FROM student_grades WHERE ssn_encrypted = ? ORDER BY subject_name ASC`,
-        args: [ssn],
-      }),
-      // 3. Attendance records
-      getClient().execute({
-        sql: `SELECT date, status, note FROM student_attendance
-                WHERE ssn_encrypted = ? ORDER BY date DESC LIMIT 60`,
-        args: [ssn],
-      }),
-      // 4. Weekly schedule (by grade + class_name from profile)
-      getClient().execute({
-        sql: `SELECT day, period, start_time, end_time, subject_name, teacher_name
-                FROM class_schedule WHERE grade_level = ? ORDER BY day ASC, period ASC`,
-        args: [gradeLevel],
-      }),
-      // 5. Announcements (general + grade-specific)
-      getClient().execute({
-        sql: `SELECT id, title, content, category, importance, created_at
-                FROM announcements ORDER BY created_at DESC LIMIT 20`,
-        args: [],
-      }),
-    ]);
-
-    if (profileRes.rows.length === 0) {
-      throw new AppError(404, 'Student not found.');
-    }
-
-    const profile = profileRes.rows[0];
-    const grades = gradesRes.rows;
-    const attendance = attendanceRes.rows;
-
-    // Compute summary stats.
-    const gradeValues = grades
-      .map((g) => parseFloat(g.grade_value))
-      .filter((v) => !isNaN(v));
-    const average =
-      gradeValues.length > 0
-        ? (gradeValues.reduce((a, b) => a + b, 0) / gradeValues.length).toFixed(1)
-        : null;
-
-    const attendanceStats = computeAttendanceStats(attendance);
-
-    return {
-      student: profile,
-      grades: grades.map((g) => ({
-        subject_name: g.subject_name,
-        grade_value: g.grade_value,
-        updated_at: g.updated_at,
-        teacher_id: g.teacher_id,
-      })),
-      average,
-      attendance: attendance.map((a) => ({
-        date: a.date,
-        status: a.status,
-        note: a.note,
-      })),
-      attendanceStats,
-      schedule: groupSchedule(scheduleRes.rows),
-      announcements: announcementsRes.rows.map((a) => ({
-        id: a.id,
-        title: a.title,
-        content: a.content,
-        category: a.category,
-        importance: a.importance,
-        created_at: a.created_at,
-      })),
-    };
+    profileRes = await getClient().execute({
+      sql: `SELECT ssn_encrypted, student_name_ar, gender, gov_code, admin_zone, school_name, grade_level, class_name
+              FROM students WHERE ssn_encrypted = ? LIMIT 1`,
+      args: [ssn],
+    });
   } catch (error) {
-    if (error instanceof AppError) throw error;
-    throw new AppError(500, 'Failed to fetch student portal', error.message);
+    throw new AppError(500, 'Failed to fetch student profile', error.message);
+  }
+  if (profileRes.rows.length === 0) {
+    throw new AppError(404, 'Student not found.');
+  }
+  const profile = profileRes.rows[0];
+
+  // 2-5. Optional sections — each wrapped so a failure degrades gracefully.
+  const [grades, attendance, schedule, announcements] = await Promise.all([
+    safeQuery(() => getClient().execute({
+      sql: `SELECT subject_name, grade_value, updated_at, teacher_id FROM student_grades WHERE ssn_encrypted = ? ORDER BY subject_name ASC`,
+      args: [ssn],
+    }), []),
+    safeQuery(() => getClient().execute({
+      sql: `SELECT date, status, note FROM student_attendance WHERE ssn_encrypted = ? ORDER BY date DESC LIMIT 60`,
+      args: [ssn],
+    }), []),
+    safeQuery(() => getClient().execute({
+      sql: `SELECT day, period, start_time, end_time, subject_name, teacher_name FROM class_schedule WHERE grade_level = ? ORDER BY day ASC, period ASC`,
+      args: [gradeLevel],
+    }), []),
+    safeQuery(() => getClient().execute({
+      sql: `SELECT id, title, content, category, importance, created_at FROM announcements ORDER BY created_at DESC LIMIT 20`,
+      args: [],
+    }), []),
+  ]);
+
+  // Compute stats.
+  const gradeValues = grades.map((g) => parseFloat(g.grade_value)).filter((v) => !isNaN(v));
+  const average =
+    gradeValues.length > 0
+      ? (gradeValues.reduce((a, b) => a + b, 0) / gradeValues.length).toFixed(1)
+      : null;
+
+  return {
+    student: profile,
+    grades: grades.map((g) => ({
+      subject_name: g.subject_name,
+      grade_value: g.grade_value,
+      updated_at: g.updated_at,
+      teacher_id: g.teacher_id,
+    })),
+    average,
+    attendance: attendance.map((a) => ({ date: a.date, status: a.status, note: a.note })),
+    attendanceStats: computeAttendanceStats(attendance),
+    schedule: groupSchedule(schedule),
+    announcements: announcements.map((a) => ({
+      id: a.id,
+      title: a.title,
+      content: a.content,
+      category: a.category,
+      importance: a.importance,
+      created_at: a.created_at,
+    })),
+  };
+}
+
+/** Run a query; return [] on any error so a failure never breaks the page. */
+async function safeQuery(fn, fallback) {
+  try {
+    const res = await fn();
+    return res.rows || fallback;
+  } catch (error) {
+    return fallback;
   }
 }
 
@@ -114,7 +107,6 @@ function computeAttendanceStats(attendance) {
   return stats;
 }
 
-/** Group schedule rows by day for the weekly timetable view. */
 function groupSchedule(rows) {
   const byDay = {};
   for (const row of rows) {
