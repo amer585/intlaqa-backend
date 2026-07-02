@@ -4,18 +4,53 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/png" href="/favicon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="description" content="منصة مدرستنا — بوابة الطلاب والمدرسين" />
+    <meta name="description" content="إدارتنا الشاملة — بوابة الطلاب" />
+    <meta name="theme-color" content="#060a13" />
     <title>إدارتنا الشاملة | بوابة الطلاب</title>
+    <style>
+      /* Critical inline CSS — renders the instant HTML arrives (no black screen). */
+      html, body { margin: 0; height: 100%; background: #060a13; }
+      body { font-family: 'Cairo', system-ui, -apple-system, 'Segoe UI', Tahoma, sans-serif; }
+      .boot {
+        position: fixed; inset: 0; display: flex; flex-direction: column;
+        align-items: center; justify-content: center; gap: 20px;
+        background: #060a13; color: #c9a96a;
+      }
+      .boot .ring {
+        width: 46px; height: 46px; border-radius: 50%;
+        border: 3px solid rgba(201,169,106,.18); border-top-color: #c9a96a;
+        animation: spin .8s linear infinite;
+      }
+      .boot p { margin: 0; font-size: 13px; letter-spacing: .15em; text-transform: uppercase; color: #6b7280; font-weight: 600; }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      .boot-err { color: #fca5a5; font-size: 13px; max-width: 420px; text-align: center; line-height: 1.6; padding: 0 20px; font-family: system-ui, monospace; }
+    </style>
+    <script>
+      // Surfaces any runtime JS error on-screen instead of a black screen.
+      window.addEventListener('error', function (e) {
+        var root = document.getElementById('root');
+        if (root && !root.dataset.appReady) {
+          root.innerHTML =
+            '<div class="boot"><div class="ring"></div>' +
+            '<p>إدارتنا الشاملة</p>' +
+            '<div class="boot-err">حدث خطأ أثناء التحميل:<br>' +
+            (e && e.message ? e.message : 'Unknown error') + '</div></div>';
+        }
+      });
+    </script>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800;900&display=swap"
-      rel="stylesheet"
-    />
-    <script type="module" crossorigin src="/assets/index-DzOleT_7.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-Be63gWsC.css">
+    <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800;900&display=swap" rel="stylesheet" />
+    <script type="module" crossorigin src="/assets/index-CqmQN8Vc.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-Cj81nUhT.css">
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <!-- Visible loader shown until React mounts. Replaced on render. -->
+      <div class="boot">
+        <div class="ring"></div>
+        <p>إدارتنا الشاملة</p>
+      </div>
+    </div>
   </body>
 </html>
