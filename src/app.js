@@ -2,13 +2,19 @@
 
 const express = require('express');
 const compression = require('compression');
+const path = require('path');
+const fs = require('fs');
 
 const createApiRouter = require('./routes');
 const { pingDatabase } = require('./db/client');
 const { redisEnabled, redisPing } = require('./db/redis');
-const { errorHandler, notFoundHandler } = require('./middleware/errorHandler');
+const { errorHandler } = require('./middleware/errorHandler');
 const { securityHeaders, corsMiddleware, apiRateLimiter } = require('./middleware/security');
 const { config } = require('./config/env');
+
+// Absolute path to the built frontend (copied into backend/public at build time).
+const PUBLIC_DIR = path.join(__dirname, '..', 'public');
+const HAS_FRONTEND = fs.existsSync(path.join(PUBLIC_DIR, 'index.html'));
 
 function createApp() {
   const app = express();
@@ -22,8 +28,9 @@ function createApp() {
   app.use(express.json({ limit: '1mb' }));
   app.use(apiRateLimiter);
 
-  // ALWAYS responds — proves the server is alive regardless of DB state.
-  app.get('/', (_req, res) => {
+  // ── API status / health (JSON) ─────────────────────────────
+  // Kept under /api so the frontend SPA can own the "/" route.
+  app.get('/api/status', (_req, res) => {
     res.json({
       status: 'ok',
       service: 'Intlaqa / Madrastna API v3',
@@ -42,7 +49,6 @@ function createApp() {
     }
     const cache = await redisPing();
     const cacheOk = !cache.enabled || cache.ok;
-    // The server is "ok" if it's listening. DB-down is "degraded" not "down".
     const allOk = db.ok && cacheOk;
     res.status(200).json({
       status: allOk ? 'ok' : 'degraded',
@@ -56,9 +62,24 @@ function createApp() {
     });
   });
 
+  // ── API routes ─────────────────────────────────────────────
   app.use('/api', createApiRouter());
 
-  app.use(notFoundHandler);
+  // ── Serve the built frontend (SPA) ─────────────────────────
+  if (HAS_FRONTEND) {
+    // Static assets with long cache.
+    app.use(express.static(PUBLIC_DIR, { maxAge: '1y', index: false }));
+    // SPA fallback: any non-/api GET returns index.html (client-side routing).
+    app.get(/^(?!\/api|\/health).*/, (_req, res) => {
+      res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
+    });
+  } else {
+    // Fallback when no frontend build is present (e.g. backend-only deploy).
+    app.get('/', (_req, res) => {
+      res.json({ status: 'ok', service: 'Intlaqa / Madrastna API v3', frontend: 'not built' });
+    });
+  }
+
   app.use(errorHandler);
 
   return app;
