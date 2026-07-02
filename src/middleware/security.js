@@ -7,9 +7,23 @@ const rateLimit = require('express-rate-limit');
 const { config } = require('../config/env');
 
 /**
- * Security headers (HSTS, no-sniff, frameguard, etc.).
+ * Security headers. Hugging Face Spaces embeds the app in an iframe on
+ * huggingface.co, so we MUST allow HF to frame us — otherwise the Space
+ * viewer shows "refused to connect" even though the app is healthy.
  */
-const securityHeaders = helmet();
+const securityHeaders = helmet({
+  // Let HF (and *.hf.space) embed the app in its Space iframe.
+  contentSecurityPolicy: {
+    useDefaults: true,
+    directives: {
+      'frame-ancestors': ["'self'", 'https://huggingface.co', 'https://*.hf.space'],
+    },
+  },
+  // X-Frame-Options is superseded by frame-ancestors; disable to avoid conflict.
+  frameguard: false,
+  // Avoid breaking resource loading from HF's own infra.
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+});
 
 /**
  * CORS restricted to the configured origins. Falls back to reflecting the
