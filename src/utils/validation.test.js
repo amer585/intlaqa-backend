@@ -40,8 +40,17 @@ test('normalizeGender maps M/F and rejects others', () => {
 });
 
 test('isBcryptHash detects bcrypt formats only', () => {
-  assert.equal(isBcryptHash('$2a$12$abcdefghijklmnopqrstuv1234567890abcdefghijklmnopqrstuv'), true);
-  assert.equal(isBcryptHash('$2b$10$abcdefghijklmnopqrstuv'), false);
+  // Canonical bcrypt = "$2a$12$" (7 chars) + 53 chars = 60 total.
+  const goodHash = '$2a$12$' + 'a'.repeat(53);
+  const goodHashB = '$2b$10$' + 'Z9'.repeat(26) + 'A'; // 7 + 53 = 60
+  assert.equal(goodHash.length, 60);
+  assert.equal(goodHashB.length, 60);
+  assert.equal(isBcryptHash(goodHash), true);
+  assert.equal(isBcryptHash(goodHashB), true);
+  // Wrong length / structure -> not a bcrypt hash.
+  assert.equal(isBcryptHash('$2b$10$abcdefghijklmnopqrstuv'), false); // too short
+  assert.equal(isBcryptHash('$2a$12$' + 'a'.repeat(52)), false); // 59 chars
   assert.equal(isBcryptHash('plaintext'), false);
   assert.equal(isBcryptHash(null), false);
+  assert.equal(isBcryptHash(undefined), false);
 });

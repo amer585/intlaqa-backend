@@ -3,7 +3,9 @@
 const AppError = require('../lib/AppError');
 
 const SSN_REGEX = /^\d{14}$/;
-const BCRYPT_HASH_REGEX = /^\$2[aby]\$\d{2}\$.{53}$/;
+// A bcrypt hash is exactly 60 chars: "$2a$10$" (7) + 53 chars of base64.
+const BCRYPT_PREFIX_REGEX = /^\$2[abxy]\$\d{2}\$/;
+const BCRYPT_TOTAL_LENGTH = 60;
 const VALID_GENDERS = new Set(['M', 'F']);
 
 /**
@@ -53,7 +55,11 @@ function normalizeGender(raw) {
 
 /** True when the stored hash looks like a bcrypt hash. @param {unknown} hash */
 function isBcryptHash(hash) {
-  return typeof hash === 'string' && BCRYPT_HASH_REGEX.test(hash);
+  return (
+    typeof hash === 'string' &&
+    hash.length === BCRYPT_TOTAL_LENGTH &&
+    BCRYPT_PREFIX_REGEX.test(hash)
+  );
 }
 
 module.exports = {
