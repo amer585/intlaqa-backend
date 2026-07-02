@@ -2,17 +2,24 @@
 
 const bcrypt = require('bcryptjs');
 
-const { withConnection } = require('../db/pools');
+const { withConnection } = require('../db/client');
 const AppError = require('../lib/AppError');
 const { normalizeRole } = require('../utils/roles');
 const { requireFields } = require('../utils/validation');
 
-/** pg unique-violation error code. */
-const UNIQUE_VIOLATION = '23505';
+/**
+ * Detect a libSQL/SQLite unique-constraint error.
+ * @param {unknown} error
+ */
+function isUniqueViolation(error) {
+  if (!error || typeof error !== 'object') return false;
+  const code = /** @type {any} */ (error).code;
+  const msg = String(/** @type {any} */ (error).message || '');
+  return code === 'SQLITE_CONSTRAINT_UNIQUE' || code === 'SQLITE_CONSTRAINT' || msg.includes('UNIQUE constraint failed');
+}
 
 /**
  * Public bootstrap endpoint: create the first staff/admin account (bcrypt 12).
- * @param {Record<string, unknown>} payload
  */
 async function registerStaff(payload = {}) {
   requireFields(payload, ['username', 'password', 'role'], 'Username, password, and role are required.');
@@ -30,18 +37,18 @@ async function registerStaff(payload = {}) {
   try {
     const passwordHash = await bcrypt.hash(password, 12);
 
-    return await withConnection(async (client) => {
-      const { rows } = await client.query(
+    return await withConnection(async (db) => {
+      const rs = await db.execute(
         `INSERT INTO teachers (username, password_hash, teacher_name_ar, role, gov_code, admin_zone, school_name)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          RETURNING teacher_id`,
         [username, passwordHash, teacherNameAr, role, govCode, adminZone, schoolName],
       );
-      return { message: 'User created securely', userId: rows[0].teacher_id };
+      return { message: 'User created securely', userId: rs.rows[0].teacher_id };
     });
   } catch (error) {
     if (error instanceof AppError) throw error;
-    if (error && error.code === UNIQUE_VIOLATION) {
+    if (isUniqueViolation(error)) {
       throw new AppError(409, 'Username already exists.');
     }
     throw new AppError(500, 'Failed to create user', error.message);
@@ -50,8 +57,6 @@ async function registerStaff(payload = {}) {
 
 /**
  * Principal-only: add a teacher scoped to the principal's own school.
- * @param {Record<string, unknown>} payload
- * @param {{ role?: string, school_name?: string, gov_code?: string, admin_zone?: string }} user
  */
 async function addTeacher(payload = {}, user = {}) {
   if (normalizeRole(user.role) !== 'principal') {
@@ -71,10 +76,10 @@ async function addTeacher(payload = {}, user = {}) {
   try {
     const passwordHash = await bcrypt.hash(password, 12);
 
-    return await withConnection(async (client) => {
-      const { rows } = await client.query(
+    return await withConnection(async (db) => {
+      const rs = await db.execute(
         `INSERT INTO teachers (username, password_hash, teacher_name_ar, role, gov_code, admin_zone, school_name)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          RETURNING teacher_id`,
         [
           username,
@@ -86,11 +91,11 @@ async function addTeacher(payload = {}, user = {}) {
           user.school_name,
         ],
       );
-      return { message: 'Teacher added successfully', teacherId: rows[0].teacher_id };
+      return { message: 'Teacher added successfully', teacherId: rs.rows[0].teacher_id };
     });
   } catch (error) {
     if (error instanceof AppError) throw error;
-    if (error && error.code === UNIQUE_VIOLATION) {
+    if (isUniqueViolation(error)) {
       throw new AppError(409, 'Username already exists.');
     }
     throw new AppError(500, 'Failed to add teacher', error.message);

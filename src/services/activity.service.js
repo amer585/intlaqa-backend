@@ -1,7 +1,7 @@
 'use strict';
 
 const { getDbUrl } = require('../config/env');
-const { withTransaction, valuesPlaceholders } = require('../db/pools');
+const { getClient } = require('../db/client');
 const AppError = require('../lib/AppError');
 const { assert14DigitSsn, assertGradeLevel } = require('../utils/validation');
 const { isValidActionCode } = require('../constants/actionTypes');
@@ -10,8 +10,8 @@ const MAX_BATCH = 500;
 
 /**
  * Persist one or many activity-log rows. Accepts a single action object or
- * `{ actions: [...] }`. All rows for a grade are inserted in ONE statement
- * inside a transaction (no per-row inserts).
+ * `{ actions: [...] }`. Uses libSQL's batch API (single network round-trip,
+ * executed as one transaction) — very efficient.
  * @param {Record<string, unknown>} payload
  */
 async function logActions(payload = {}) {
@@ -38,19 +38,16 @@ async function logActions(payload = {}) {
 
   const summaries = [];
   for (const [gradeLevel, rows] of byGrade) {
-    const dbUrl = getDbUrl(gradeLevel);
-    if (!dbUrl) throw new AppError(400, `Invalid grade_level: ${gradeLevel}.`);
+    if (!getDbUrl(gradeLevel)) throw new AppError(400, `Invalid grade_level: ${gradeLevel}.`);
 
-    const inserted = await withTransaction(async (client) => {
-      const placeholders = valuesPlaceholders(rows.length, 3); // ($1,$2,$3),(...)
-      const values = rows.flatMap((r) => [r.ssn_encrypted, r.action_type, r.metadata]);
-      const { rowCount } = await client.query(
-        `INSERT INTO activity_logs (ssn_encrypted, action_type, metadata) VALUES ${placeholders}`,
-        values,
-      );
-      return rowCount ?? 0;
-    });
+    // libSQL batch: one round-trip, atomic — perfect for bulk inserts.
+    const stmts = rows.map((r) => ({
+      sql: 'INSERT INTO activity_logs (ssn_encrypted, action_type, metadata) VALUES (?, ?, ?)',
+      args: [r.ssn_encrypted, r.action_type, r.metadata],
+    }));
 
+    const results = await getClient().batch(stmts, 'write');
+    const inserted = results.reduce((sum, rs) => sum + (rs.rowsAffected || 0), 0);
     summaries.push({ grade_level: gradeLevel, inserted });
   }
 

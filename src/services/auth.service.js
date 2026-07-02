@@ -4,7 +4,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
 const { config } = require('../config/env');
-const { withConnection } = require('../db/pools');
+const { withConnection } = require('../db/client');
 const AppError = require('../lib/AppError');
 const logger = require('../lib/logger');
 const { isBcryptHash } = require('../utils/validation');
@@ -21,11 +21,11 @@ async function loginStaff(payload = {}) {
   }
 
   try {
-    return await withConnection(async (client) => {
-      const { rows } = await client.query(
+    return await withConnection(async (db) => {
+      const { rows } = await db.execute(
         `SELECT teacher_id, teacher_name_ar, role, gov_code, admin_zone, school_name, password_hash
            FROM teachers
-          WHERE username = $1 AND is_active = TRUE
+          WHERE username = ? AND is_active = 1
           LIMIT 1`,
         [String(username)],
       );

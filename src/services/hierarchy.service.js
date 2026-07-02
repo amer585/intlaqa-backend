@@ -1,7 +1,7 @@
 'use strict';
 
 const { config, getDbUrl } = require('../config/env');
-const { withConnection } = require('../db/pools');
+const { withConnection } = require('../db/client');
 const AppError = require('../lib/AppError');
 const {
   isDirectorateRole,
@@ -23,8 +23,8 @@ async function loadSchools() {
 
   schoolCache.inflight = (async () => {
     try {
-      const schools = await withConnection(async (client) => {
-        const { rows } = await client.query(
+      const schools = await withConnection(async (db) => {
+        const { rows } = await db.execute(
           `SELECT DISTINCT school_name, admin_zone, gov_code
              FROM teachers
             WHERE school_name IS NOT NULL AND school_name <> 'ALL'
@@ -95,26 +95,25 @@ async function getClassesForHierarchy(query = {}, user = {}) {
     throw new AppError(403, 'Forbidden: You can only fetch classes from your assigned school.');
   }
 
-  return withConnection(async (client) => {
+  return withConnection(async (db) => {
     const params = [schoolName];
-    let idx = 2;
-    let sql = `SELECT class_name, grade_level, COUNT(*)::int AS student_count
+    let sql = `SELECT class_name, grade_level, COUNT(*) AS student_count
                  FROM students
-                WHERE school_name = $1 AND class_name IS NOT NULL AND class_name <> ''`;
+                WHERE school_name = ? AND class_name IS NOT NULL AND class_name <> ''`;
     if (gradeLevel !== null) {
-      sql += ` AND grade_level = $${idx++}`;
+      sql += ' AND grade_level = ?';
       params.push(gradeLevel);
     }
     if (isDistrictOnlyRole(role) && user.admin_zone && user.admin_zone !== 'ALL') {
-      sql += ` AND admin_zone = $${idx++}`;
+      sql += ' AND admin_zone = ?';
       params.push(user.admin_zone);
     }
     if (isDirectorateRole(role) && user.gov_code) {
-      sql += ` AND gov_code = $${idx++}`;
+      sql += ' AND gov_code = ?';
       params.push(user.gov_code);
     }
     sql += ' GROUP BY class_name, grade_level ORDER BY grade_level ASC, class_name ASC';
-    const { rows } = await client.query(sql, params);
+    const { rows } = await db.execute(sql, params);
     return rows;
   });
 }
@@ -133,9 +132,9 @@ async function getStudentsForHierarchy(query = {}, user = {}) {
   }
 
   try {
-    return await withConnection(async (client) => {
+    return await withConnection(async (db) => {
       if (subjectName) {
-        const { rows } = await client.query(
+        const { rows } = await db.execute(
           `SELECT s.ssn_encrypted, s.student_name_ar, s.gender,
                   g.subject_name, g.grade_value, g.teacher_id, g.updated_at AS grade_updated_at
              FROM students s
@@ -143,17 +142,17 @@ async function getStudentsForHierarchy(query = {}, user = {}) {
                ON g.ssn_encrypted = s.ssn_encrypted
               AND g.grade_level = s.grade_level
               AND g.class_name = s.class_name
-              AND g.subject_name = $1
-            WHERE s.school_name = $2 AND s.grade_level = $3 AND s.class_name = $4`,
+              AND g.subject_name = ?
+            WHERE s.school_name = ? AND s.grade_level = ? AND s.class_name = ?`,
           [subjectName, schoolName, gradeLevel, className],
         );
         return { students: mapRosterWithGrades(rows) };
       }
 
-      const { rows } = await client.query(
+      const { rows } = await db.execute(
         `SELECT ssn_encrypted, student_name_ar, gender
            FROM students
-          WHERE school_name = $1 AND grade_level = $2 AND class_name = $3
+          WHERE school_name = ? AND grade_level = ? AND class_name = ?
           ORDER BY student_name_ar ASC`,
         [schoolName, gradeLevel, className],
       );

@@ -20,9 +20,10 @@ function parseList(raw) {
   return Array.from(new Set(raw.split(',').map((s) => s.trim()).filter(Boolean)));
 }
 
-// ── Database (single PostgreSQL) ──────────────────────────────
-// NEVER throw — if DATABASE_URL is missing, mark db as unavailable and keep booting.
+// ── Database (Turso / libSQL) ────────────────────────────────
+// NEVER throw — if DATABASE_URL is missing, mark db unavailable and keep booting.
 const databaseUrl = process.env.DATABASE_URL || null;
+const tursoAuthToken = process.env.TURSO_AUTH_TOKEN || null;
 const dbAvailable = Boolean(databaseUrl);
 
 // ── JWT ───────────────────────────────────────────────────────
@@ -45,27 +46,21 @@ const config = Object.freeze({
   corsOrigins: parseList(process.env.CORS_ORIGINS),
 
   databaseUrl,
+  tursoAuthToken,
   dbAvailable,
-  schema: process.env.PG_SCHEMA || 'public',
-  sslMode: (process.env.DB_SSL_MODE || 'require').toLowerCase(),
-  sslCaPath: process.env.DB_SSL_CA_PATH || null,
-  pool: Object.freeze({
-    max: parseIntEnv(process.env.DB_POOL_MAX, 10),
-    idleTimeoutMillis: parseIntEnv(process.env.DB_POOL_IDLE_TIMEOUT_MS, 30000),
-    connectionTimeoutMillis: 10000,
-  }),
+  schoolCacheTtlMs: 30 * 60 * 1000,
 
   upstashRedisUrl: process.env.UPSTASH_REDIS_REST_URL || null,
   upstashRedisToken: process.env.UPSTASH_REDIS_REST_TOKEN || null,
   redisTtlSec: parseIntEnv(process.env.REDIS_TTL_SEC, 300),
 
-  schoolCacheTtlMs: 30 * 60 * 1000,
   allowTestLogin: String(process.env.ALLOW_TEST_LOGIN ?? 'false') === 'true',
   rateLimitMax: parseIntEnv(process.env.RATE_LIMIT_MAX, DEFAULT_RATE_LIMIT_MAX),
 });
 
 /**
- * Map a grade level (1-12) to the database URL. Returns null if DB unavailable.
+ * Map a grade level (1-12) to the database URL (seam kept for future sharding).
+ * With a single Turso DB this always returns the same URL for valid grades.
  */
 function getDbUrl(gradeLevel) {
   if (!config.dbAvailable) return null;

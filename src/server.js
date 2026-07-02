@@ -2,7 +2,7 @@
 
 const { createApp } = require('./app');
 const { config } = require('./config/env');
-const { getPool, closeAllPools } = require('./db/pools');
+const { getClient, closeClient, wrap } = require('./db/client');
 const { runMigrations } = require('./db/migrate');
 const logger = require('./lib/logger');
 
@@ -41,7 +41,7 @@ function startServer() {
     shuttingDown = true;
     logger.info(`${signal} received, shutting down gracefully`);
     server.close(async () => {
-      await closeAllPools();
+      await closeClient();
       logger.info('Closed cleanly');
       process.exit(0);
     });
@@ -57,12 +57,8 @@ function startServer() {
 // Background migration — never blocks startup, never crashes the process.
 async function runMigrationsAsync() {
   try {
-    const client = await getPool().connect();
-    try {
-      await runMigrations(client);
-    } finally {
-      client.release();
-    }
+    const db = wrap(getClient());
+    await runMigrations(db);
   } catch (error) {
     logger.error('Schema migration failed', { message: error.message });
   }

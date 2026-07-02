@@ -4,7 +4,7 @@ const express = require('express');
 const compression = require('compression');
 
 const createApiRouter = require('./routes');
-const { pingDatabase } = require('./db/pools');
+const { pingDatabase } = require('./db/client');
 const { redisEnabled, redisPing } = require('./db/redis');
 const { errorHandler, notFoundHandler } = require('./middleware/errorHandler');
 const { securityHeaders, corsMiddleware, apiRateLimiter } = require('./middleware/security');

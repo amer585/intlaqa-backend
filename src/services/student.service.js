@@ -1,8 +1,8 @@
 'use strict';
 
 const { config, getDbUrl } = require('../config/env');
-const { withConnection } = require('../db/pools');
-const { redisGet, redisSetEx } = require('../db/redis');
+const { withConnection } = require('../db/client');
+const { redisGet, redisSetEx, redisDel } = require('../db/redis');
 const AppError = require('../lib/AppError');
 const { resolveGovCode, resolveGovName } = require('../utils/governorates');
 const { isDistrictManagerRole, normalizeRole } = require('../utils/roles');
@@ -12,8 +12,7 @@ const TEST_SSN = '11111111111111';
 
 /**
  * Student "login" = profile lookup by 14-digit token + grade level.
- * Implements cache-aside: Redis first, PostgreSQL second.
- * @param {Record<string, unknown>} payload
+ * Implements cache-aside: Redis first, libSQL second.
  */
 async function loginStudent(payload = {}) {
   requireFields(payload, ['ssn_encrypted', 'grade_level'], 'ssn_encrypted and grade_level are required');
@@ -58,11 +57,11 @@ async function loginStudent(payload = {}) {
   }
 
   try {
-    const result = await withConnection(async (client) => {
-      const { rows } = await client.query(
+    const result = await withConnection(async (db) => {
+      const { rows } = await db.execute(
         `SELECT student_name_ar, school_name, class_name, admin_zone, gov_code, gender
            FROM students
-          WHERE ssn_encrypted = $1
+          WHERE ssn_encrypted = ?
           LIMIT 1`,
         [ssn],
       );
@@ -87,7 +86,6 @@ async function loginStudent(payload = {}) {
       };
     });
 
-    // Write-through to Redis (best-effort).
     await redisSetEx(cacheKey, config.redisTtlSec, JSON.stringify(result));
     return result;
   } catch (error) {
@@ -99,8 +97,6 @@ async function loginStudent(payload = {}) {
 /**
  * Create or update a student. Principals are locked to their own school.
  * Invalidates the cache entry on write.
- * @param {Record<string, unknown>} payload
- * @param {Record<string, unknown>} user
  */
 async function saveStudent(payload = {}, user = {}) {
   requireFields(payload, ['ssn_encrypted', 'grade_level'], 'ssn_encrypted and grade_level are required');
@@ -131,19 +127,19 @@ async function saveStudent(payload = {}, user = {}) {
         : payload.admin_zone || null;
 
   try {
-    const result = await withConnection(async (client) => {
-      const { rowCount } = await client.query(
+    const result = await withConnection(async (db) => {
+      const rs = await db.execute(
         `INSERT INTO students
             (ssn_encrypted, student_name_ar, gender, gov_code, admin_zone, school_name, grade_level, class_name)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         ON CONFLICT (ssn_encrypted) DO UPDATE SET
-            student_name_ar = EXCLUDED.student_name_ar,
-            gender          = EXCLUDED.gender,
-            gov_code        = EXCLUDED.gov_code,
-            admin_zone      = EXCLUDED.admin_zone,
-            school_name     = EXCLUDED.school_name,
-            grade_level     = EXCLUDED.grade_level,
-            class_name      = EXCLUDED.class_name`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(ssn_encrypted) DO UPDATE SET
+            student_name_ar = excluded.student_name_ar,
+            gender          = excluded.gender,
+            gov_code        = excluded.gov_code,
+            admin_zone      = excluded.admin_zone,
+            school_name     = excluded.school_name,
+            grade_level     = excluded.grade_level,
+            class_name      = excluded.class_name`,
         [
           ssn,
           payload.student_name_ar ? String(payload.student_name_ar) : null,
@@ -155,11 +151,9 @@ async function saveStudent(payload = {}, user = {}) {
           className,
         ],
       );
-      return { affectedRows: rowCount };
+      return { affectedRows: rs.rowsAffected };
     });
 
-    // Cache-aside: drop the stale cached profile (best-effort).
-    const { redisDel } = require('../db/redis');
     await redisDel(`student:${gradeLevel}:${ssn}`);
 
     return { message: 'Student saved successfully', affectedRows: result.affectedRows };
