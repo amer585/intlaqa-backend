@@ -72,6 +72,19 @@ async function runMigrations(db) {
     `CREATE INDEX IF NOT EXISTS idx_class_subject
        ON teacher_classes (grade_level, class_name, subject_name)`,
 
+    // ── Weekly assessments (التقديرات الأسبوعية) ─────────────
+    `CREATE TABLE IF NOT EXISTS weekly_assessments (
+       id            INTEGER PRIMARY KEY AUTOINCREMENT,
+       ssn_encrypted TEXT NOT NULL,
+       subject_name  TEXT NOT NULL,
+       week_number   INTEGER NOT NULL,
+       score         REAL NOT NULL,
+       max_score     REAL DEFAULT 10,
+       UNIQUE(ssn_encrypted, subject_name, week_number)
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_wa_ssn
+       ON weekly_assessments (ssn_encrypted, week_number)`,
+
     // ── School portal tables ─────────────────────────────────
     `CREATE TABLE IF NOT EXISTS announcements (
        id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,6 +142,7 @@ async function runMigrations(db) {
 
   // Seed default portal data (announcements, schedule) if tables are empty.
   await seedDefaults(db);
+  await seedWeeklyAssessments(db);
 }
 
 /**
@@ -183,6 +197,45 @@ async function seedDefaults(db) {
     }
   } catch (error) {
     logger.warn('Seed defaults skipped', { message: error.message });
+  }
+}
+
+/**
+ * Seed weekly assessments for the demo student if none exist.
+ * Egyptian system: تقديرات أسبوعية out of 10 per subject per week, ~12 weeks.
+ */
+async function seedWeeklyAssessments(db) {
+  try {
+    const { rows } = await db.execute('SELECT COUNT(*) as c FROM weekly_assessments');
+    if (Number(rows[0]?.c) > 0) return;
+
+    const SSN = '11111111111111';
+    const subjects = [
+      { name: 'اللغة العربية', base: 7.5 },
+      { name: 'اللغة الإنجليزية', base: 7.0 },
+      { name: 'الرياضيات', base: 8.5 },
+      { name: 'العلوم', base: 8.0 },
+      { name: 'الدراسات الاجتماعية', base: 8.2 },
+      { name: 'التربية الدينية', base: 9.0 },
+      { name: 'الحاسب الآلي', base: 9.2 },
+    ];
+
+    let count = 0;
+    for (const subj of subjects) {
+      for (let week = 1; week <= 12; week++) {
+        // Vary slightly per week with a realistic trend (slight improvement).
+        const variance = (Math.sin(week * 1.3 + subj.base) * 1.2);
+        const score = Math.min(10, Math.max(4, subj.base + variance + (week * 0.1)));
+        await db.execute(
+          'INSERT OR IGNORE INTO weekly_assessments (ssn_encrypted, subject_name, week_number, score, max_score) VALUES (?, ?, ?, ?, ?)',
+          [SSN, subj.name, week, Math.round(score * 10) / 10, 10],
+        );
+        count++;
+      }
+    }
+    logger.info('Seeded weekly assessments', { count, subjects: subjects.length });
+  } catch (error) {
+    logger.warn('Weekly assessments seed skipped', { message: error.message });
   }
 }
 

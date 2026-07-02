@@ -34,8 +34,8 @@ async function getStudentPortal(query = {}) {
   }
   const profile = profileRes.rows[0];
 
-  // 2-5. Optional sections — each wrapped so a failure degrades gracefully.
-  const [grades, attendance, schedule, announcements] = await Promise.all([
+  // 2-6. Optional sections — each wrapped so a failure degrades gracefully.
+  const [grades, attendance, schedule, announcements, weeklyAssessments] = await Promise.all([
     safeQuery(() => getClient().execute({
       sql: `SELECT subject_name, grade_value, updated_at, teacher_id FROM student_grades WHERE ssn_encrypted = ? ORDER BY subject_name ASC`,
       args: [ssn],
@@ -52,6 +52,10 @@ async function getStudentPortal(query = {}) {
       sql: `SELECT id, title, content, category, importance, created_at FROM announcements ORDER BY created_at DESC LIMIT 20`,
       args: [],
     }), []),
+    safeQuery(() => getClient().execute({
+      sql: `SELECT subject_name, week_number, score, max_score FROM weekly_assessments WHERE ssn_encrypted = ? ORDER BY subject_name ASC, week_number ASC`,
+      args: [ssn],
+    }), []),
   ]);
 
   // Compute stats.
@@ -60,6 +64,19 @@ async function getStudentPortal(query = {}) {
     gradeValues.length > 0
       ? (gradeValues.reduce((a, b) => a + b, 0) / gradeValues.length).toFixed(1)
       : null;
+
+  // Group weekly assessments by subject for the line chart + table.
+  const weeklyBySubject = {};
+  for (const wa of weeklyAssessments) {
+    if (!weeklyBySubject[wa.subject_name]) {
+      weeklyBySubject[wa.subject_name] = [];
+    }
+    weeklyBySubject[wa.subject_name].push({
+      week: wa.week_number,
+      score: wa.score,
+      max_score: wa.max_score,
+    });
+  }
 
   return {
     student: profile,
@@ -70,8 +87,15 @@ async function getStudentPortal(query = {}) {
       teacher_id: g.teacher_id,
     })),
     average,
+    weeklyAssessments: weeklyBySubject,
     attendance: attendance.map((a) => ({ date: a.date, status: a.status, note: a.note })),
     attendanceStats: computeAttendanceStats(attendance),
+    // Egyptian rule: 30 unexcused absence days = exam denial risk (حرمان).
+    absenceLimit: {
+      used: attendance.filter((a) => String(a.status).toLowerCase() === 'absent').length,
+      limit: 30,
+      remaining: Math.max(0, 30 - attendance.filter((a) => String(a.status).toLowerCase() === 'absent').length),
+    },
     schedule: groupSchedule(schedule),
     announcements: announcements.map((a) => ({
       id: a.id,
