@@ -32,11 +32,11 @@ async function getStudentPortal(query = {}) {
     return cached;
   }
 
-  // 1. Profile — the only hard requirement.
+  // 1. Profile + grades_json (all subjects in ONE column) — single query.
   let profileRes;
   try {
     profileRes = await getClient().execute({
-      sql: `SELECT ssn_encrypted, student_name_ar, gender, gov_code, admin_zone, school_name, grade_level, class_name
+      sql: `SELECT ssn_encrypted, student_name_ar, gender, gov_code, admin_zone, school_name, grade_level, class_name, grades_json
               FROM students WHERE ssn_encrypted = ? LIMIT 1`,
       args: [ssn],
     });
@@ -48,12 +48,25 @@ async function getStudentPortal(query = {}) {
   }
   const profile = profileRes.rows[0];
 
-  // 2-6. Optional sections — each wrapped so a failure degrades gracefully.
-  const [grades, attendance, schedule, announcements, weeklyAssessments] = await Promise.all([
-    safeQuery(() => getClient().execute({
-      sql: `SELECT subject_name, grade_value, updated_at, teacher_id FROM student_grades WHERE ssn_encrypted = ? ORDER BY subject_name ASC`,
-      args: [ssn],
-    }), []),
+  // Parse the single-column grades JSON into the grades array.
+  let gradesObj = {};
+  try {
+    gradesObj = typeof profile.grades_json === 'string' && profile.grades_json
+      ? JSON.parse(profile.grades_json)
+      : {};
+  } catch {
+    gradesObj = {};
+  }
+  const grades = Object.entries(gradesObj).map(([subject_name, grade_value]) => ({
+    subject_name,
+    grade_value: String(grade_value),
+    updated_at: null,
+    teacher_id: null,
+  }));
+
+  // 2-5. Optional sections (grades now come from the single grades_json column
+  // parsed above, so they're no longer queried separately).
+  const [attendance, schedule, announcements, weeklyAssessments] = await Promise.all([
     safeQuery(() => getClient().execute({
       sql: `SELECT date, status, note FROM student_attendance WHERE ssn_encrypted = ? ORDER BY date DESC LIMIT 60`,
       args: [ssn],
@@ -95,12 +108,7 @@ async function getStudentPortal(query = {}) {
   // Build the full result.
   const result = {
     student: profile,
-    grades: grades.map((g) => ({
-      subject_name: g.subject_name,
-      grade_value: g.grade_value,
-      updated_at: g.updated_at,
-      teacher_id: g.teacher_id,
-    })),
+    grades: grades.sort((a, b) => a.subject_name.localeCompare(b.subject_name, 'ar')),
     average,
     weeklyAssessments: weeklyBySubject,
     attendance: attendance.map((a) => ({ date: a.date, status: a.status, note: a.note })),

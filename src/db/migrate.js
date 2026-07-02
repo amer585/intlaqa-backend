@@ -31,6 +31,7 @@ async function runMigrations(db) {
        school_name     TEXT,
        grade_level     INTEGER NOT NULL,
        class_name      TEXT,
+       grades_json     TEXT DEFAULT '{}',
        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
        updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
      )`,
@@ -140,9 +141,63 @@ async function runMigrations(db) {
   }
   logger.info('Database schema ready (Turso/libSQL)', { statements: statements.length });
 
+  // Ensure existing students table has the grades_json column (ALTER is a no-op
+  // if the column already exists; we guard with a try/catch since SQLite lacks
+  // ADD COLUMN IF NOT EXISTS).
+  try {
+    await db.execute('ALTER TABLE students ADD COLUMN grades_json TEXT DEFAULT "{}"');
+    logger.info('Added grades_json column to students');
+  } catch {
+    // Column already exists — expected on subsequent boots.
+  }
+
+  // Migrate legacy per-subject rows from student_grades into the new
+  // single-column grades_json (one column per student, all subjects together).
+  await migrateGradesToJson(db);
+
   // Seed default portal data (announcements, schedule) if tables are empty.
   await seedDefaults(db);
   await seedWeeklyAssessments(db);
+}
+
+/**
+ * Migrate legacy student_grades rows (one per subject) into the new
+ * students.grades_json column (one column holding all subjects as JSON).
+ * Idempotent: only migrates students whose grades_json is empty/missing.
+ */
+async function migrateGradesToJson(db) {
+  try {
+    // Find students with empty grades_json that have legacy grade rows.
+    const { rows } = await db.execute(
+      `SELECT s.ssn_encrypted, sg.subject_name, sg.grade_value
+         FROM students s
+         JOIN student_grades sg ON sg.ssn_encrypted = s.ssn_encrypted
+        WHERE COALESCE(s.grades_json, '') = '' OR s.grades_json = '{}'
+        ORDER BY s.ssn_encrypted`,
+    );
+
+    if (rows.length === 0) return; // nothing to migrate
+
+    // Group by student SSN.
+    /** @type {Record<string, Record<string, string>>} */
+    const byStudent = {};
+    for (const row of rows) {
+      if (!byStudent[row.ssn_encrypted]) byStudent[row.ssn_encrypted] = {};
+      byStudent[row.ssn_encrypted][row.subject_name] = String(row.grade_value);
+    }
+
+    let migrated = 0;
+    for (const [ssn, grades] of Object.entries(byStudent)) {
+      await db.execute({
+        sql: 'UPDATE students SET grades_json = ? WHERE ssn_encrypted = ?',
+        args: [JSON.stringify(grades), ssn],
+      });
+      migrated++;
+    }
+    logger.info('Migrated legacy grades into grades_json', { students: migrated, rows: rows.length });
+  } catch (error) {
+    logger.warn('Grade migration skipped', { message: error.message });
+  }
 }
 
 /**

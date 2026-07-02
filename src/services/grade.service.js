@@ -1,7 +1,7 @@
 'use strict';
 
 const { getDbUrl } = require('../config/env');
-const { withConnection, withTransaction, valuesPlaceholders, inPlaceholders } = require('../db/client');
+const { withConnection, withTransaction, inPlaceholders } = require('../db/client');
 const { invalidate } = require('../db/diskCache');
 const AppError = require('../lib/AppError');
 const { requireFields, assert14DigitSsn, assertGradeLevel } = require('../utils/validation');
@@ -58,33 +58,40 @@ async function updateGrade(payload, user) {
       throw new AppError(403, 'Forbidden: Teacher cannot edit grades for this subject/class.');
     }
 
-    // 2 + 3. Validate students exist, then upsert — one transaction.
+    // 2 + 3. Validate students exist, then update the single grades_json column
+    // for each student (read-modify-write inside one transaction).
     await withTransaction(async (db) => {
       const ssns = clean.map((g) => g.ssn_encrypted);
 
       const inClause = inPlaceholders(ssns.length);
       const { rows: found } = await db.execute(
-        `SELECT ssn_encrypted FROM students
+        `SELECT ssn_encrypted, grades_json FROM students
           WHERE grade_level = ? AND class_name = ? AND ssn_encrypted IN (${inClause})`,
         [gradeLevel, className, ...ssns],
       );
-      const foundSet = new Set(found.map((r) => r.ssn_encrypted));
-      const missing = ssns.filter((s) => !foundSet.has(s));
+      const foundMap = new Map(found.map((r) => [r.ssn_encrypted, r.grades_json]));
+      const missing = ssns.filter((s) => !foundMap.has(s));
       if (missing.length > 0) {
         throw new AppError(404, `Students not found in grade ${gradeLevel} / class ${className}: ${missing.join(', ')}`);
       }
 
-      const placeholders = valuesPlaceholders(clean.length, 6);
-      const values = clean.flatMap((g) => [g.ssn_encrypted, gradeLevel, className, subjectName, g.grade_value, user.teacher_id]);
-      await db.execute(
-        `INSERT INTO student_grades (ssn_encrypted, grade_level, class_name, subject_name, grade_value, teacher_id)
-         VALUES ${placeholders}
-         ON CONFLICT(ssn_encrypted, grade_level, class_name, subject_name) DO UPDATE SET
-            grade_value = excluded.grade_value,
-            teacher_id  = excluded.teacher_id,
-            updated_at  = datetime('now')`,
-        values,
-      );
+      // For each target student: merge the new subject grade into grades_json.
+      const toUpdate = clean.filter((g) => foundMap.has(g.ssn_encrypted));
+      for (const g of toUpdate) {
+        let existing = {};
+        try {
+          existing = foundMap.get(g.ssn_encrypted)
+            ? JSON.parse(foundMap.get(g.ssn_encrypted))
+            : {};
+        } catch {
+          existing = {};
+        }
+        existing[subjectName] = g.grade_value;
+        await db.execute(
+          `UPDATE students SET grades_json = ?, updated_at = datetime('now') WHERE ssn_encrypted = ?`,
+          [JSON.stringify(existing), g.ssn_encrypted],
+        );
+      }
     });
 
     // ── Write-through: invalidate each affected student's cached portal so
