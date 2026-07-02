@@ -10,6 +10,7 @@ const { registerStaff, addTeacher } = require('../services/staff.service');
 const { loginStudent, saveStudent } = require('../services/student.service');
 const { updateGrade } = require('../services/grade.service');
 const { logActions } = require('../services/activity.service');
+const { getStudentPortal } = require('../services/studentPortal.service');
 const {
   getClassesForHierarchy,
   getDistrictsForUser,

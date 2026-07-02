@@ -1,6 +1,5 @@
 'use strict';
 
-const { withConnection } = require('../db/client');
 const { getClient } = require('../db/client');
 const AppError = require('../lib/AppError');
 const { assert14DigitSsn, assertGradeLevel } = require('../utils/validation');
