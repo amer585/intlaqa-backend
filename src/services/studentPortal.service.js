@@ -1,14 +1,17 @@
 'use strict';
 
 const { getClient } = require('../db/client');
+const { getCacheAsync, setCache } = require('../db/diskCache');
 const AppError = require('../lib/AppError');
 const { assert14DigitSsn, assertGradeLevel } = require('../utils/validation');
 
+const CACHE_TTL_SEC = 300; // 5 minutes — reduces Turso reads dramatically.
+
 /**
  * Fetch the full student portal: profile, grades, attendance, schedule,
- * and announcements. Each section is queried independently with try/catch so
- * a single failing query NEVER causes a 500 — it just returns empty for that
- * section. The profile is the only hard requirement.
+ * and announcements. Uses a read-through DISK cache: try local cache first
+ * (survives process restarts within the same container), then Turso, then
+ * write-through to cache. This reduces reads to Turso significantly.
  *
  * @param {{ ssn_encrypted?: string, grade_level?: number }} query
  */
@@ -17,6 +20,13 @@ async function getStudentPortal(query = {}) {
   assert14DigitSsn(query.ssn_encrypted);
   const gradeLevel = assertGradeLevel(query.grade_level);
   const ssn = String(query.ssn_encrypted);
+
+  // ── Read-through: check disk cache first ──
+  const cacheKey = `portal:${ssn}:${gradeLevel}`;
+  const cached = await getCacheAsync(cacheKey);
+  if (cached) {
+    return cached;
+  }
 
   // 1. Profile — the only hard requirement.
   let profileRes;
@@ -65,7 +75,7 @@ async function getStudentPortal(query = {}) {
       ? (gradeValues.reduce((a, b) => a + b, 0) / gradeValues.length).toFixed(1)
       : null;
 
-  // Group weekly assessments by subject for the line chart + table.
+  // Group weekly assessments by subject.
   const weeklyBySubject = {};
   for (const wa of weeklyAssessments) {
     if (!weeklyBySubject[wa.subject_name]) {
@@ -78,7 +88,8 @@ async function getStudentPortal(query = {}) {
     });
   }
 
-  return {
+  // Build the full result.
+  const result = {
     student: profile,
     grades: grades.map((g) => ({
       subject_name: g.subject_name,
@@ -90,7 +101,6 @@ async function getStudentPortal(query = {}) {
     weeklyAssessments: weeklyBySubject,
     attendance: attendance.map((a) => ({ date: a.date, status: a.status, note: a.note })),
     attendanceStats: computeAttendanceStats(attendance),
-    // Egyptian rule: 30 unexcused absence days = exam denial risk (حرمان).
     absenceLimit: {
       used: attendance.filter((a) => String(a.status).toLowerCase() === 'absent').length,
       limit: 30,
@@ -106,6 +116,11 @@ async function getStudentPortal(query = {}) {
       created_at: a.created_at,
     })),
   };
+
+  // ── Write-through to disk cache so subsequent reads skip Turso ──
+  await setCache(cacheKey, result, CACHE_TTL_SEC);
+
+  return result;
 }
 
 /** Run a query; return [] on any error so a failure never breaks the page. */
@@ -113,7 +128,7 @@ async function safeQuery(fn, fallback) {
   try {
     const res = await fn();
     return res.rows || fallback;
-  } catch (error) {
+  } catch {
     return fallback;
   }
 }

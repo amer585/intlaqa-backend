@@ -4,6 +4,7 @@ const { createApp } = require('./app');
 const { config } = require('./config/env');
 const { getClient, closeClient, wrap } = require('./db/client');
 const { runMigrations } = require('./db/migrate');
+const { initDiskCache, cleanupExpired } = require('./db/diskCache');
 const logger = require('./lib/logger');
 
 // NEVER let an unhandled error kill the process silently.
@@ -28,6 +29,11 @@ function startServer() {
   const server = app.listen(config.port, '0.0.0.0', () => {
     logger.info(`Intlaqa backend listening on 0.0.0.0:${config.port} (${config.env})`);
   });
+
+  // Initialize disk cache (local SQLite file — survives process restarts).
+  initDiskCache();
+  // Clean up expired cache entries periodically.
+  cleanupExpired().catch(() => {});
 
   // Auto-create tables on boot (idempotent). Runs AFTER the port is open so a
   // slow/failing DB never prevents the server from responding.
