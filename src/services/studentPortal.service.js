@@ -5,19 +5,19 @@ const { getCacheAsync, setCache } = require('../db/diskCache');
 const AppError = require('../lib/AppError');
 const { assert14DigitSsn, assertGradeLevel } = require('../utils/validation');
 
-// Never-expire: cached portal data is served from disk on every subsequent
-// read (zero Turso reads) until a write invalidates the key. If the HF disk is
-// wiped on restart, the cache is rebuilt automatically from Turso on the first
-// read. This is the write-through cache-aside pattern.
+// Never-expire: cached portal data served from disk on every read until a write
+// invalidates it. If HF disk is wiped, cache rebuilds from Turso on first read.
 const CACHE_TTL_SEC = 0;
 
 /**
- * Fetch the full student portal: profile, grades, attendance, schedule,
- * and announcements. Uses a read-through DISK cache: try local cache first
- * (survives process restarts within the same container), then Turso, then
- * write-through to cache. This reduces reads to Turso significantly.
+ * Fetch the FULL student portal from a SINGLE database row.
  *
- * @param {{ ssn_encrypted?: string, grade_level?: number }} query
+ * All per-student data (grades, attendance, weekly assessments) is stored as
+ * JSON columns ON the students row, so this reads exactly ONE row from Turso
+ * (plus the shared schedule + announcements). That's the minimum possible
+ * read cost — no table scans, no joins, no per-subject rows.
+ *
+ * With the disk cache, repeat reads cost ZERO Turso reads.
  */
 async function getStudentPortal(query = {}) {
   if (!query.ssn_encrypted) throw new AppError(400, 'ssn_encrypted is required.');
@@ -28,15 +28,15 @@ async function getStudentPortal(query = {}) {
   // ── Read-through: check disk cache first ──
   const cacheKey = `portal:${ssn}:${gradeLevel}`;
   const cached = await getCacheAsync(cacheKey);
-  if (cached) {
-    return cached;
-  }
+  if (cached) return cached;
 
-  // 1. Profile + grades_json (all subjects in ONE column) — single query.
+  // ── SINGLE row read: profile + all JSON columns in one query ──
   let profileRes;
   try {
     profileRes = await getClient().execute({
-      sql: `SELECT ssn_encrypted, student_name_ar, gender, gov_code, admin_zone, school_name, grade_level, class_name, grades_json
+      sql: `SELECT ssn_encrypted, student_name_ar, gender, gov_code, admin_zone,
+                   school_name, grade_level, class_name,
+                   grades_json, attendance_json, weekly_json
               FROM students WHERE ssn_encrypted = ? LIMIT 1`,
       args: [ssn],
     });
@@ -46,31 +46,39 @@ async function getStudentPortal(query = {}) {
   if (profileRes.rows.length === 0) {
     throw new AppError(404, 'Student not found.');
   }
-  const profile = profileRes.rows[0];
+  const row = profileRes.rows[0];
 
-  // Parse the single-column grades JSON into the grades array.
-  let gradesObj = {};
-  try {
-    gradesObj = typeof profile.grades_json === 'string' && profile.grades_json
-      ? JSON.parse(profile.grades_json)
-      : {};
-  } catch {
-    gradesObj = {};
-  }
-  const grades = Object.entries(gradesObj).map(([subject_name, grade_value]) => ({
-    subject_name,
-    grade_value: String(grade_value),
-    updated_at: null,
-    teacher_id: null,
-  }));
+  // Parse all JSON columns from the single row.
+  const gradesObj = parseJson(row.grades_json, {});
+  const attendanceArr = parseJson(row.attendance_json, []);
+  const weeklyObj = parseJson(row.weekly_json, {});
 
-  // 2-5. Optional sections (grades now come from the single grades_json column
-  // parsed above, so they're no longer queried separately).
-  const [attendance, schedule, announcements, weeklyAssessments] = await Promise.all([
-    safeQuery(() => getClient().execute({
-      sql: `SELECT date, status, note FROM student_attendance WHERE ssn_encrypted = ? ORDER BY date DESC LIMIT 60`,
-      args: [ssn],
-    }), []),
+  // Build grades array.
+  const grades = Object.entries(gradesObj)
+    .filter(([, v]) => v !== null && v !== undefined && v !== '')
+    .map(([subject_name, grade_value]) => ({
+      subject_name,
+      grade_value: String(grade_value),
+    }))
+    .sort((a, b) => a.subject_name.localeCompare(b.subject_name, 'ar'));
+
+  // Compute average.
+  const gradeValues = grades.map((g) => parseFloat(g.grade_value)).filter((v) => !isNaN(v));
+  const average =
+    gradeValues.length > 0
+      ? (gradeValues.reduce((a, b) => a + b, 0) / gradeValues.length).toFixed(1)
+      : null;
+
+  // Compute attendance stats.
+  const attendanceStats = computeAttendanceStats(attendanceArr);
+  const absenceLimit = {
+    used: attendanceArr.filter((a) => String(a.status).toLowerCase() === 'absent').length,
+    limit: 30,
+    remaining: Math.max(0, 30 - attendanceArr.filter((a) => String(a.status).toLowerCase() === 'absent').length),
+  };
+
+  // ── Shared data: schedule + announcements (small, cached by the disk cache) ──
+  const [schedule, announcements] = await Promise.all([
     safeQuery(() => getClient().execute({
       sql: `SELECT day, period, start_time, end_time, subject_name, teacher_name FROM class_schedule WHERE grade_level = ? ORDER BY day ASC, period ASC`,
       args: [gradeLevel],
@@ -79,45 +87,26 @@ async function getStudentPortal(query = {}) {
       sql: `SELECT id, title, content, category, importance, created_at FROM announcements ORDER BY created_at DESC LIMIT 20`,
       args: [],
     }), []),
-    safeQuery(() => getClient().execute({
-      sql: `SELECT subject_name, week_number, score, max_score FROM weekly_assessments WHERE ssn_encrypted = ? ORDER BY subject_name ASC, week_number ASC`,
-      args: [ssn],
-    }), []),
   ]);
 
-  // Compute stats.
-  const gradeValues = grades.map((g) => parseFloat(g.grade_value)).filter((v) => !isNaN(v));
-  const average =
-    gradeValues.length > 0
-      ? (gradeValues.reduce((a, b) => a + b, 0) / gradeValues.length).toFixed(1)
-      : null;
-
-  // Group weekly assessments by subject.
-  const weeklyBySubject = {};
-  for (const wa of weeklyAssessments) {
-    if (!weeklyBySubject[wa.subject_name]) {
-      weeklyBySubject[wa.subject_name] = [];
-    }
-    weeklyBySubject[wa.subject_name].push({
-      week: wa.week_number,
-      score: wa.score,
-      max_score: wa.max_score,
-    });
-  }
-
-  // Build the full result.
+  // Build the result.
   const result = {
-    student: profile,
-    grades: grades.sort((a, b) => a.subject_name.localeCompare(b.subject_name, 'ar')),
-    average,
-    weeklyAssessments: weeklyBySubject,
-    attendance: attendance.map((a) => ({ date: a.date, status: a.status, note: a.note })),
-    attendanceStats: computeAttendanceStats(attendance),
-    absenceLimit: {
-      used: attendance.filter((a) => String(a.status).toLowerCase() === 'absent').length,
-      limit: 30,
-      remaining: Math.max(0, 30 - attendance.filter((a) => String(a.status).toLowerCase() === 'absent').length),
+    student: {
+      ssn_encrypted: row.ssn_encrypted,
+      student_name_ar: row.student_name_ar,
+      gender: row.gender,
+      gov_code: row.gov_code,
+      admin_zone: row.admin_zone,
+      school_name: row.school_name,
+      grade_level: row.grade_level,
+      class_name: row.class_name,
     },
+    grades,
+    average,
+    weeklyAssessments: weeklyObj,
+    attendance: attendanceArr,
+    attendanceStats,
+    absenceLimit,
     schedule: groupSchedule(schedule),
     announcements: announcements.map((a) => ({
       id: a.id,
@@ -129,10 +118,19 @@ async function getStudentPortal(query = {}) {
     })),
   };
 
-  // ── Write-through to disk cache so subsequent reads skip Turso ──
+  // Write-through to disk cache.
   await setCache(cacheKey, result, CACHE_TTL_SEC);
 
   return result;
+}
+
+/** Safe JSON parse with fallback. */
+function parseJson(raw, fallback) {
+  try {
+    return typeof raw === 'string' && raw ? JSON.parse(raw) : fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 /** Run a query; return [] on any error so a failure never breaks the page. */

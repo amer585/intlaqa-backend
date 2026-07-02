@@ -32,6 +32,8 @@ async function runMigrations(db) {
        grade_level     INTEGER NOT NULL,
        class_name      TEXT,
        grades_json     TEXT DEFAULT '{}',
+       attendance_json TEXT DEFAULT '[]',
+       weekly_json     TEXT DEFAULT '{}',
        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
        updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
      )`,
@@ -141,23 +143,187 @@ async function runMigrations(db) {
   }
   logger.info('Database schema ready (Turso/libSQL)', { statements: statements.length });
 
-  // Ensure existing students table has the grades_json column (ALTER is a no-op
-  // if the column already exists; we guard with a try/catch since SQLite lacks
+  // Ensure existing students table has the JSON columns (ALTER is a no-op if
+  // the column already exists; we guard with try/catch since SQLite lacks
   // ADD COLUMN IF NOT EXISTS).
-  try {
-    await db.execute('ALTER TABLE students ADD COLUMN grades_json TEXT DEFAULT "{}"');
-    logger.info('Added grades_json column to students');
-  } catch {
-    // Column already exists — expected on subsequent boots.
+  for (const [col, def] of [['grades_json', 'TEXT DEFAULT "{}"'], ['attendance_json', 'TEXT DEFAULT "[]"'], ['weekly_json', 'TEXT DEFAULT "{}"']]) {
+    try {
+      await db.execute(`ALTER TABLE students ADD COLUMN ${col} ${def}`);
+      logger.info('Added column to students', { column: col });
+    } catch {
+      // Column already exists — expected on subsequent boots.
+    }
   }
 
-  // Migrate legacy per-subject rows from student_grades into the new
-  // single-column grades_json (one column per student, all subjects together).
+  // Migrate legacy tables into the single-row JSON columns.
   await migrateGradesToJson(db);
+  await migrateAttendanceToJson(db);
+  await migrateWeeklyToJson(db);
+
+  // Drop legacy tables that are now fully replaced by JSON columns.
+  await dropLegacyTables(db);
 
   // Seed default portal data (announcements, schedule) if tables are empty.
   await seedDefaults(db);
-  await seedWeeklyAssessments(db);
+  await seedStudentJsonDefaults(db);
+}
+
+/**
+ * Drop legacy tables replaced by JSON columns. Safe because all data has been
+ * migrated into students.grades_json / attendance_json / weekly_json.
+ */
+async function dropLegacyTables(db) {
+  for (const table of ['student_grades', 'student_attendance', 'weekly_assessments']) {
+    try {
+      await db.execute(`DROP TABLE IF EXISTS ${table}`);
+      logger.info('Dropped legacy table', { table });
+    } catch {
+      /* ignore — table may not exist */
+    }
+  }
+}
+
+/**
+ * Migrate legacy student_attendance rows into students.attendance_json.
+ */
+async function migrateAttendanceToJson(db) {
+  try {
+    const { rows } = await db.execute(
+      `SELECT s.ssn_encrypted, sa.date, sa.status, sa.note
+         FROM students s
+         JOIN student_attendance sa ON sa.ssn_encrypted = s.ssn_encrypted
+        WHERE COALESCE(s.attendance_json, '') = '' OR s.attendance_json = '[]'
+        ORDER BY s.ssn_encrypted, sa.date DESC`,
+    );
+    if (rows.length === 0) return;
+
+    /** @type {Record<string, Array<{date:string,status:string,note:string|null}>>} */
+    const byStudent = {};
+    for (const row of rows) {
+      if (!byStudent[row.ssn_encrypted]) byStudent[row.ssn_encrypted] = [];
+      byStudent[row.ssn_encrypted].push({
+        date: row.date,
+        status: row.status,
+        note: row.note,
+      });
+    }
+
+    let migrated = 0;
+    for (const [ssn, records] of Object.entries(byStudent)) {
+      await db.execute({
+        sql: 'UPDATE students SET attendance_json = ? WHERE ssn_encrypted = ?',
+        args: [JSON.stringify(records), ssn],
+      });
+      migrated++;
+    }
+    logger.info('Migrated attendance into attendance_json', { students: migrated, records: rows.length });
+  } catch {
+    // Table may not exist yet — skip silently.
+  }
+}
+
+/**
+ * Migrate legacy weekly_assessments rows into students.weekly_json.
+ */
+async function migrateWeeklyToJson(db) {
+  try {
+    const { rows } = await db.execute(
+      `SELECT s.ssn_encrypted, wa.subject_name, wa.week_number, wa.score, wa.max_score
+         FROM students s
+         JOIN weekly_assessments wa ON wa.ssn_encrypted = s.ssn_encrypted
+        WHERE COALESCE(s.weekly_json, '') = '' OR s.weekly_json = '{}'
+        ORDER BY s.ssn_encrypted, wa.subject_name, wa.week_number`,
+    );
+    if (rows.length === 0) return;
+
+    /** @type {Record<string, Record<string, Array<{week:number,score:number,max_score:number}>>>} */
+    const byStudent = {};
+    for (const row of rows) {
+      if (!byStudent[row.ssn_encrypted]) byStudent[row.ssn_encrypted] = {};
+      const subj = row.subject_name;
+      if (!byStudent[row.ssn_encrypted][subj]) byStudent[row.ssn_encrypted][subj] = [];
+      byStudent[row.ssn_encrypted][subj].push({
+        week: row.week_number,
+        score: row.score,
+        max_score: row.max_score,
+      });
+    }
+
+    let migrated = 0;
+    for (const [ssn, weekly] of Object.entries(byStudent)) {
+      await db.execute({
+        sql: 'UPDATE students SET weekly_json = ? WHERE ssn_encrypted = ?',
+        args: [JSON.stringify(weekly), ssn],
+      });
+      migrated++;
+    }
+    logger.info('Migrated weekly assessments into weekly_json', { students: migrated });
+  } catch {
+    // Table may not exist yet — skip silently.
+  }
+}
+
+/**
+ * Seed default JSON data for students that have no grades/attendance/weekly yet.
+ * Only runs for students that exist but have empty JSON columns.
+ */
+async function seedStudentJsonDefaults(db) {
+  try {
+    // Find the demo student with empty weekly_json
+    const { rows } = await db.execute(
+      `SELECT ssn_encrypted FROM students WHERE COALESCE(weekly_json,'') = '' OR weekly_json = '{}'`,
+    );
+    if (rows.length === 0) return;
+
+    const subjects = [
+      { name: 'اللغة العربية', base: 7.5 },
+      { name: 'اللغة الإنجليزية', base: 7.0 },
+      { name: 'الرياضيات', base: 8.5 },
+      { name: 'العلوم', base: 8.0 },
+      { name: 'الدراسات الاجتماعية', base: 8.2 },
+      { name: 'التربية الدينية', base: 9.0 },
+      { name: 'الحاسب الآلي', base: 9.2 },
+    ];
+
+    // Build weekly assessment JSON: { subject: [{week, score, max_score}] }
+    const weekly = {};
+    for (const subj of subjects) {
+      weekly[subj.name] = [];
+      for (let week = 1; week <= 12; week++) {
+        const variance = Math.sin(week * 1.3 + subj.base) * 1.2;
+        const score = Math.min(10, Math.max(4, subj.base + variance + (week * 0.1)));
+        weekly[subj.name].push({ week, score: Math.round(score * 10) / 10, max_score: 10 });
+      }
+    }
+
+    // Build attendance JSON
+    const attendance = [];
+    const statuses = ['present','present','present','present','present','present','present','present','present','present','present','present','present','present','present','present','present','late','present','absent'];
+    const today = new Date();
+    let dayCount = 0;
+    for (let i = 0; i < 40 && dayCount < 20; i++) {
+      const d = new Date(today);
+      d.setDate(d.getDate() - i);
+      const dow = d.getDay();
+      if (dow === 5 || dow === 6) continue;
+      attendance.push({
+        date: d.toISOString().slice(0, 10),
+        status: statuses[dayCount],
+        note: statuses[dayCount] === 'late' ? 'تأخير 15 دقيقة' : statuses[dayCount] === 'absent' ? 'غياب بدون عذر' : null,
+      });
+      dayCount++;
+    }
+
+    for (const row of rows) {
+      await db.execute({
+        sql: 'UPDATE students SET weekly_json = ?, attendance_json = ? WHERE ssn_encrypted = ?',
+        args: [JSON.stringify(weekly), JSON.stringify(attendance), row.ssn_encrypted],
+      });
+    }
+    logger.info('Seeded weekly + attendance JSON for students', { count: rows.length });
+  } catch {
+    /* ignore */
+  }
 }
 
 /**
@@ -252,45 +418,6 @@ async function seedDefaults(db) {
     }
   } catch (error) {
     logger.warn('Seed defaults skipped', { message: error.message });
-  }
-}
-
-/**
- * Seed weekly assessments for the demo student if none exist.
- * Egyptian system: تقديرات أسبوعية out of 10 per subject per week, ~12 weeks.
- */
-async function seedWeeklyAssessments(db) {
-  try {
-    const { rows } = await db.execute('SELECT COUNT(*) as c FROM weekly_assessments');
-    if (Number(rows[0]?.c) > 0) return;
-
-    const SSN = '11111111111111';
-    const subjects = [
-      { name: 'اللغة العربية', base: 7.5 },
-      { name: 'اللغة الإنجليزية', base: 7.0 },
-      { name: 'الرياضيات', base: 8.5 },
-      { name: 'العلوم', base: 8.0 },
-      { name: 'الدراسات الاجتماعية', base: 8.2 },
-      { name: 'التربية الدينية', base: 9.0 },
-      { name: 'الحاسب الآلي', base: 9.2 },
-    ];
-
-    let count = 0;
-    for (const subj of subjects) {
-      for (let week = 1; week <= 12; week++) {
-        // Vary slightly per week with a realistic trend (slight improvement).
-        const variance = (Math.sin(week * 1.3 + subj.base) * 1.2);
-        const score = Math.min(10, Math.max(4, subj.base + variance + (week * 0.1)));
-        await db.execute(
-          'INSERT OR IGNORE INTO weekly_assessments (ssn_encrypted, subject_name, week_number, score, max_score) VALUES (?, ?, ?, ?, ?)',
-          [SSN, subj.name, week, Math.round(score * 10) / 10, 10],
-        );
-        count++;
-      }
-    }
-    logger.info('Seeded weekly assessments', { count, subjects: subjects.length });
-  } catch (error) {
-    logger.warn('Weekly assessments seed skipped', { message: error.message });
   }
 }
 
