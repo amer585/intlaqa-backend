@@ -3,6 +3,7 @@
 const { config, getDbUrl } = require('../config/env');
 const { withConnection } = require('../db/client');
 const { redisGet, redisSetEx, redisDel } = require('../db/redis');
+const { invalidate } = require('../db/diskCache');
 const AppError = require('../lib/AppError');
 const { resolveGovCode, resolveGovName } = require('../utils/governorates');
 const { isDistrictManagerRole, normalizeRole } = require('../utils/roles');
@@ -136,6 +137,8 @@ async function saveStudent(payload = {}, user = {}) {
     });
 
     await redisDel(`student:${gradeLevel}:${ssn}`);
+    // Write-through: invalidate the disk-cached portal so it rebuilds from DB.
+    await invalidate(`portal:${ssn}:${gradeLevel}`);
 
     return { message: 'Student saved successfully', affectedRows: result.affectedRows };
   } catch (error) {

@@ -2,6 +2,7 @@
 
 const { getDbUrl } = require('../config/env');
 const { withConnection, withTransaction, valuesPlaceholders, inPlaceholders } = require('../db/client');
+const { invalidate } = require('../db/diskCache');
 const AppError = require('../lib/AppError');
 const { requireFields, assert14DigitSsn, assertGradeLevel } = require('../utils/validation');
 
@@ -85,6 +86,12 @@ async function updateGrade(payload, user) {
         values,
       );
     });
+
+    // ── Write-through: invalidate each affected student's cached portal so
+    // the next read rebuilds it fresh from Turso (cache stays consistent). ──
+    for (const g of clean) {
+      await invalidate(`portal:${g.ssn_encrypted}:${gradeLevel}`);
+    }
 
     return { message: 'Grades updated successfully.', updated: clean.length };
   } catch (error) {

@@ -5,8 +5,11 @@ const path = require('path');
 const fs = require('fs');
 const logger = require('../lib/logger');
 
-// Default TTL: 5 minutes (portal data doesn't change every second).
+// Default TTL: 5 minutes. Pass 0 (or NEVER_EXPIRES) for entries that should
+// persist until explicitly invalidated by a write — they survive restarts and
+// are rebuilt from Turso automatically if the disk is wiped.
 const DEFAULT_TTL_SEC = 300;
+const NEVER_EXPIRES = 9999999999; // year ~2286 — effectively forever
 
 let client = null;
 let enabled = false;
@@ -94,13 +97,40 @@ async function getCacheAsync(key) {
 async function setCache(key, value, ttlSec = DEFAULT_TTL_SEC) {
   if (!enabled || !client) return;
   try {
-    const expiresAt = Math.floor(Date.now() / 1000) + ttlSec;
+    // 0 (or any falsy) = never expire — kept until a write explicitly invalidates it.
+    const expiresAt = ttlSec && ttlSec > 0
+      ? Math.floor(Date.now() / 1000) + ttlSec
+      : NEVER_EXPIRES;
     await client.execute({
       sql: 'INSERT OR REPLACE INTO cache_kv (key, value, expires_at) VALUES (?, ?, ?)',
       args: [key, JSON.stringify(value), expiresAt],
     });
   } catch {
     // Cache write failure is non-fatal.
+  }
+}
+
+/**
+ * Invalidate every cache key matching a prefix. Use after writes that change
+ * data scoped to many students (e.g. a school-wide announcement).
+ * @param {string} prefix
+ */
+async function invalidatePrefix(prefix) {
+  if (!enabled || !client) return;
+  try {
+    await client.execute({ sql: 'DELETE FROM cache_kv WHERE key LIKE ?', args: [`${prefix}%`] });
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Wipe the entire cache. Rarely needed — nuclear option. */
+async function clearAll() {
+  if (!enabled || !client) return;
+  try {
+    await client.execute('DELETE FROM cache_kv');
+  } catch {
+    /* ignore */
   }
 }
 
@@ -133,6 +163,8 @@ module.exports = {
   getCacheAsync,
   setCache,
   invalidate,
+  invalidatePrefix,
+  clearAll,
   cleanupExpired,
   isEnabled: () => enabled,
 };

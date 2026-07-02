@@ -5,7 +5,11 @@ const { getCacheAsync, setCache } = require('../db/diskCache');
 const AppError = require('../lib/AppError');
 const { assert14DigitSsn, assertGradeLevel } = require('../utils/validation');
 
-const CACHE_TTL_SEC = 300; // 5 minutes — reduces Turso reads dramatically.
+// Never-expire: cached portal data is served from disk on every subsequent
+// read (zero Turso reads) until a write invalidates the key. If the HF disk is
+// wiped on restart, the cache is rebuilt automatically from Turso on the first
+// read. This is the write-through cache-aside pattern.
+const CACHE_TTL_SEC = 0;
 
 /**
  * Fetch the full student portal: profile, grades, attendance, schedule,
