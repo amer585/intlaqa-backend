@@ -1,108 +1,101 @@
 -- ═══════════════════════════════════════════════════════════
--- INTLAQA — TiDB Schema Migration
--- Run this on EACH of your 3 TiDB clusters:
---   DB_PRIMARY   (grades 1–6)
---   DB_PREP      (grades 7–9)
---   DB_SECONDARY (grades 10–12)
+-- INTLAQA / MADRASTNA — PostgreSQL Schema (single database)
+-- Grades 1–12 and staff all live in this ONE database for now.
+-- The 4-database sharding can be reintroduced later by routing getDbUrl().
+-- Run with:  psql "$DATABASE_URL" -f schema.sql
 -- ═══════════════════════════════════════════════════════════
 
--- ─────────────────────────────────────────────────────────
--- 1. STUDENTS TABLE
---    Primary table for student profiles.
---    ssn_encrypted is the SOLE unique identifier.
--- ─────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS students (
-  ssn_encrypted   VARCHAR(14)   NOT NULL,
-  student_name_ar VARCHAR(100)  DEFAULT NULL,
-  gender          CHAR(1)       DEFAULT NULL,    -- 'M' or 'F' (1 byte)
-  gov_code        VARCHAR(10)   DEFAULT NULL,
-  admin_zone      VARCHAR(50)   DEFAULT NULL,
-  school_name     VARCHAR(100)  DEFAULT NULL,
-  grade_level     TINYINT       NOT NULL,         -- 1 byte (not INT = 4 bytes)
-  class_name      VARCHAR(30)   DEFAULT NULL,
-  created_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
-  updated_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-
-  PRIMARY KEY (ssn_encrypted)
-  -- ssn_encrypted IS the clustered index in TiDB.
-  -- All lookups by SSN are O(1). No secondary index needed.
+-- ───────────── TEACHERS / STAFF ─────────────
+CREATE TABLE IF NOT EXISTS teachers (
+  teacher_id      BIGSERIAL    PRIMARY KEY,
+  username        VARCHAR(64)  NOT NULL UNIQUE,
+  password_hash   VARCHAR(72)  NOT NULL,
+  teacher_name_ar VARCHAR(100),
+  role            VARCHAR(32)  NOT NULL DEFAULT 'teacher',
+  gov_code        VARCHAR(10),
+  admin_zone      VARCHAR(50)  DEFAULT 'ALL',
+  school_name     VARCHAR(100) DEFAULT 'ALL',
+  is_active       BOOLEAN      NOT NULL DEFAULT TRUE,
+  created_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  updated_at      TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 
+-- ───────────── STUDENTS ─────────────
+CREATE TABLE IF NOT EXISTS students (
+  ssn_encrypted   VARCHAR(14)  PRIMARY KEY,
+  student_name_ar VARCHAR(100),
+  gender          CHAR(1),
+  gov_code        VARCHAR(10),
+  admin_zone      VARCHAR(50),
+  school_name     VARCHAR(100),
+  grade_level     SMALLINT     NOT NULL,
+  class_name      VARCHAR(30),
+  created_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  updated_at      TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
 CREATE INDEX IF NOT EXISTS idx_class_lookup
   ON students (school_name, grade_level, class_name, admin_zone);
 
--- ─────────────────────────────────────────────────────────
--- 1B. STUDENT GRADES TABLE
---     Scoped by student, grade level, and class to keep
---     roster joins bounded to the active class only.
--- ─────────────────────────────────────────────────────────
+-- ───────────── STUDENT GRADES ─────────────
 CREATE TABLE IF NOT EXISTS student_grades (
-  grade_id         BIGINT        NOT NULL AUTO_INCREMENT,
-  ssn_encrypted    VARCHAR(14)   NOT NULL,
-  grade_level      TINYINT       NOT NULL,
-  class_name       VARCHAR(30)   NOT NULL,
-  subject_name     VARCHAR(100)  NOT NULL,
-  grade_value      VARCHAR(50)   DEFAULT NULL,
-  teacher_id       BIGINT        DEFAULT NULL,
-  created_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
-  updated_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-
-  PRIMARY KEY (grade_id),
-  UNIQUE KEY uq_student_grade_scope (ssn_encrypted, grade_level, class_name, subject_name),
-  INDEX idx_grade_roster_lookup (grade_level, class_name, ssn_encrypted)
+  grade_id      BIGSERIAL    PRIMARY KEY,
+  ssn_encrypted VARCHAR(14)  NOT NULL,
+  grade_level   SMALLINT     NOT NULL,
+  class_name    VARCHAR(30)  NOT NULL,
+  subject_name  VARCHAR(100) NOT NULL,
+  grade_value   VARCHAR(50),
+  teacher_id    BIGINT,
+  created_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  UNIQUE (ssn_encrypted, grade_level, class_name, subject_name)
 );
-
-ALTER TABLE student_grades
-  ADD COLUMN IF NOT EXISTS grade_level TINYINT NOT NULL DEFAULT 0,
-  ADD COLUMN IF NOT EXISTS class_name VARCHAR(30) NOT NULL DEFAULT '';
-
--- If your existing table still has a legacy student+subject unique key,
--- drop it before applying the scoped unique index below.
-CREATE UNIQUE INDEX IF NOT EXISTS uq_student_grade_scope
-  ON student_grades (ssn_encrypted, grade_level, class_name, subject_name);
-
 CREATE INDEX IF NOT EXISTS idx_grade_roster_lookup
   ON student_grades (grade_level, class_name, ssn_encrypted);
 
-
--- ─────────────────────────────────────────────────────────
--- 2. ACTIVITY LOGS TABLE
---    Ultra-lightweight action tracking.
---
---    RU SAVINGS:
---    • action_type is TINYINT (1 byte) not VARCHAR (20+ bytes)
---      → saves ~19 bytes × 130M rows/day = 2.47 GB/day
---    • metadata is nullable JSON — only used when needed
---    • Composite index on (ssn_encrypted, logged_at) for
---      efficient "recent activity" queries
---    • AUTO_INCREMENT id for fast inserts (append-only)
--- ─────────────────────────────────────────────────────────
+-- ───────────── ACTIVITY LOGS ─────────────
 CREATE TABLE IF NOT EXISTS activity_logs (
-  id              BIGINT        NOT NULL AUTO_INCREMENT,
-  ssn_encrypted   VARCHAR(14)   NOT NULL,
-  action_type     TINYINT       NOT NULL,         -- 1 byte! See mapping below
-  metadata        JSON          DEFAULT NULL,     -- nullable, only when extra data needed
-  logged_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
-
-  PRIMARY KEY (id),
-
-  -- Composite index: "show me recent activity for student X"
-  -- Covers: WHERE ssn_encrypted = ? ORDER BY logged_at DESC LIMIT N
-  INDEX idx_ssn_time (ssn_encrypted, logged_at DESC)
+  id            BIGSERIAL   PRIMARY KEY,
+  ssn_encrypted VARCHAR(14) NOT NULL,
+  action_type   SMALLINT    NOT NULL,
+  metadata      JSONB,
+  logged_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE INDEX IF NOT EXISTS idx_ssn_time
+  ON activity_logs (ssn_encrypted, logged_at DESC);
 
--- ─────────────────────────────────────────────────────────
--- ACTION TYPE REFERENCE (stored in code, not in DB)
--- Using TINYINT instead of ENUM or VARCHAR saves bytes
--- and avoids schema migrations when adding new types.
--- ─────────────────────────────────────────────────────────
---  1  = LOGIN
---  2  = LOGOUT
---  3  = VIEW_PROFILE
---  4  = VIEW_GRADES
---  5  = VIEW_ATTENDANCE
---  6  = VIEW_SCHEDULE
---  10 = TEACHER_LOGIN
---  11 = TEACHER_GRADE_ENTRY
---  12 = TEACHER_ATTENDANCE_ENTRY
--- ─────────────────────────────────────────────────────────
+-- ───────────── TEACHER → CLASS/SUBJECT ASSIGNMENTS ─────────────
+CREATE TABLE IF NOT EXISTS teacher_classes (
+  id           BIGSERIAL   PRIMARY KEY,
+  teacher_id   BIGINT      NOT NULL,
+  grade_level  SMALLINT    NOT NULL,
+  class_name   VARCHAR(30) NOT NULL,
+  subject_name VARCHAR(100) NOT NULL,
+  UNIQUE (teacher_id, grade_level, class_name, subject_name)
+);
+CREATE INDEX IF NOT EXISTS idx_class_subject
+  ON teacher_classes (grade_level, class_name, subject_name);
+
+-- ───────────── updated_at trigger (shared) ─────────────
+CREATE OR REPLACE FUNCTION set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = now();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$ BEGIN
+  CREATE TRIGGER teachers_updated_at   BEFORE UPDATE ON teachers   FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+  CREATE TRIGGER students_updated_at   BEFORE UPDATE ON students   FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+  CREATE TRIGGER student_grades_updated_at BEFORE UPDATE ON student_grades FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+-- ───────────── ACTION TYPE REFERENCE (stored in code, not DB) ─────────────
+--  1=LOGIN  2=LOGOUT  3=VIEW_PROFILE  4=VIEW_GRADES  5=VIEW_ATTENDANCE
+--  6=VIEW_SCHEDULE  10=TEACHER_LOGIN  11=TEACHER_GRADE_ENTRY  12=TEACHER_ATTENDANCE_ENTRY

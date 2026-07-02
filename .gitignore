@@ -1,12 +1,8 @@
-# Dependencies
 node_modules/
-
-# Environment variables (NEVER commit)
 .env
-
-# OS files
+.env.*
+!.env.example
+npm-debug.log*
 .DS_Store
-Thumbs.db
-
-# Logs
-*.log
+coverage/
+dist/

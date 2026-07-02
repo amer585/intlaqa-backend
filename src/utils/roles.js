@@ -1,34 +1,30 @@
+'use strict';
+
+/** @param {string} role */
 function normalizeRole(role) {
   return String(role || '').trim().toLowerCase();
 }
 
+/** Directorate / directorate-manager scope. @param {string} role */
 function isDirectorateRole(role) {
-  const normalizedRole = normalizeRole(role);
-
-  return (
-    normalizedRole === 'directorate' ||
-    normalizedRole === 'directorate_manager' ||
-    normalizedRole === 'directorate manager'
-  );
+  const r = normalizeRole(role);
+  return r === 'directorate' || r === 'directorate_manager' || r === 'directorate manager';
 }
 
+/** District-only scope (single admin zone). @param {string} role */
 function isDistrictOnlyRole(role) {
-  const normalizedRole = normalizeRole(role);
-
-  return (
-    normalizedRole === 'district' ||
-    normalizedRole === 'district_manager' ||
-    normalizedRole === 'district manager'
-  );
+  const r = normalizeRole(role);
+  return r === 'district' || r === 'district_manager' || r === 'district manager';
 }
 
+/** Any manager that spans multiple schools within a district/directorate. */
 function isDistrictManagerRole(role) {
   return isDistrictOnlyRole(role) || isDirectorateRole(role);
 }
 
+/** School-scoped roles (principal / teacher) — locked to one school. */
 function isSchoolScopedRole(role) {
-  const normalizedRole = normalizeRole(role);
-  return normalizedRole === 'principal' || normalizedRole === 'teacher';
+  return normalizeRole(role) === 'principal' || normalizeRole(role) === 'teacher';
 }
 
 module.exports = {

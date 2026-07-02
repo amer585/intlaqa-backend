@@ -1,0 +1,42 @@
+name: Deploy to Hugging Face Spaces
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel a previous run on the same ref.
+concurrency:
+  group: hf-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci --ignore-scripts
+      - run: npm test --if-present
+
+      - name: Push to Hugging Face Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_SPACE: ${{ vars.HF_SPACE }}
+        run: |
+          if [ -z "$HF_TOKEN" ] || [ -z "$HF_SPACE" ]; then
+            echo "Set HF_TOKEN (secret) and HF_SPACE (variable, e.g. amer21/mcp) in the repo settings."
+            exit 1
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add space "https://amer585:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE}" || \
+            git remote set-url space "https://amer585:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE}"
+          git push -f space main

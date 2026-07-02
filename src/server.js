@@ -1,47 +1,47 @@
+'use strict';
+
 const { createApp } = require('./app');
-const { config } = require('./config');
+const { config } = require('./config/env');
 const { closeAllPools } = require('./db/pools');
+const logger = require('./lib/logger');
 
+// Never let an unhandled error kill the process silently.
 process.on('uncaughtException', (error) => {
-  console.error('Uncaught Exception:', error.message);
+  logger.error('Uncaught exception', { message: error.message, stack: error.stack });
 });
-
-process.on('unhandledRejection', (error) => {
-  console.error('Unhandled Rejection:', error);
+process.on('unhandledRejection', (reason) => {
+  logger.error('Unhandled rejection', { reason: String(reason) });
 });
 
 function startServer() {
   const app = createApp();
   const server = app.listen(config.port, '0.0.0.0', () => {
-    console.log(`Madrastna Enterprise Backend running on port ${config.port}`);
+    logger.info(`Intlaqa backend listening on 0.0.0.0:${config.port} (${config.env})`);
   });
 
-  const shutdown = createShutdown(server);
+  let shuttingDown = false;
+  async function shutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    logger.info(`${signal} received, shutting down gracefully`);
+    server.close(async () => {
+      await closeAllPools();
+      logger.info('Closed cleanly');
+      process.exit(0);
+    });
+    // Don't hang forever if a connection refuses to drop.
+    setTimeout(() => process.exit(1), 10000).unref();
+  }
+
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
 
-  return { app, server, shutdown };
+  return { app, server };
 }
 
-function createShutdown(server) {
-  let shuttingDown = false;
-
-  return async function shutdown(signal) {
-    if (shuttingDown) {
-      return;
-    }
-
-    shuttingDown = true;
-    console.log(`\n${signal} received. Shutting down gracefully...`);
-
-    server.close(async () => {
-      await closeAllPools();
-      console.log('Server shut down cleanly.');
-      process.exit(0);
-    });
-  };
+// Only boot when run directly (not when required by tests).
+if (require.main === module) {
+  startServer();
 }
 
-module.exports = {
-  startServer,
-};
+module.exports = { startServer };

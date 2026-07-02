@@ -1,33 +1,35 @@
+'use strict';
+
 const AppError = require('../lib/AppError');
+const logger = require('../lib/logger');
 
-function notFoundHandler(req, res, next) {
-  next(new AppError(404, `Route not found: ${req.method} ${req.originalUrl}`));
-}
-
+/**
+ * Normalise any thrown error into a consistent JSON envelope:
+ *   { error: string, details?: unknown, code?: string }
+ */
+// eslint-disable-next-line no-unused-vars
 function errorHandler(error, req, res, next) {
-  void next;
+  const isOperational = error instanceof AppError;
+  const statusCode = isOperational ? error.statusCode : 500;
 
-  const isAppError = error instanceof AppError;
-  const statusCode = isAppError ? error.statusCode : 500;
-
-  console.error(`[${req.method} ${req.originalUrl}]`, error.stack || error.message);
-
-  const response = {
-    error: isAppError ? error.message : 'Internal server error',
-  };
-
-  if (isAppError && error.details !== undefined) {
-    if (error.details && typeof error.details === 'object' && !Array.isArray(error.details)) {
-      Object.assign(response, error.details);
-    } else {
-      response.details = error.details;
-    }
+  if (!isOperational) {
+    logger.error('Unhandled error', {
+      path: req.path,
+      method: req.method,
+      message: error.message,
+      stack: error.stack,
+    });
   }
 
-  res.status(statusCode).json(response);
+  res.status(statusCode).json({
+    error: statusCode === 500 ? 'Internal Server Error' : error.message,
+    ...(error.details ? { details: error.details } : {}),
+  });
 }
 
-module.exports = {
-  notFoundHandler,
-  errorHandler,
-};
+/** 404 handler for unmatched routes. */
+function notFoundHandler(req, res) {
+  res.status(404).json({ error: `Route not found: ${req.method} ${req.path}` });
+}
+
+module.exports = { errorHandler, notFoundHandler };
