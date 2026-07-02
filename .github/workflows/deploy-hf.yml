@@ -20,7 +20,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
 
       - run: npm ci --ignore-scripts
@@ -28,15 +28,42 @@ jobs:
 
       - name: Push to Hugging Face Space
         env:
+          # HF_TOKEN must be a Secret. (The deploy will fail clearly if missing.)
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_SPACE: ${{ vars.HF_SPACE }}
+          # HF_SPACE works whether you put it in Variables OR Secrets, and
+          # falls back to 'amer21/mcp' if unset — so this step can't fail on it.
+          HF_SPACE: ${{ vars.HF_SPACE || secrets.HF_SPACE || 'amer21/mcp' }}
         run: |
-          if [ -z "$HF_TOKEN" ] || [ -z "$HF_SPACE" ]; then
-            echo "Set HF_TOKEN (secret) and HF_SPACE (variable, e.g. amer21/mcp) in the repo settings."
+          if [ -z "$HF_TOKEN" ]; then
+            echo "=================================================="
+            echo "❌ HF_TOKEN secret is missing!"
+            echo "   GitHub repo → Settings → Secrets and variables"
+            echo "   → Actions → New repository secret"
+            echo "   Name:  HF_TOKEN"
+            echo "   Value: your Hugging Face access token (hf_...)"
+            echo "=================================================="
             exit 1
           fi
+
+          echo "✓ HF_TOKEN present"
+          echo "✓ Target Space: ${HF_SPACE}"
+          echo "→ Pushing to Hugging Face..."
+
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git remote add space "https://amer585:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE}" || \
-            git remote set-url space "https://amer585:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE}"
-          git push -f space main
+
+          git remote remove space 2>/dev/null || true
+          git remote add space "https://amer21:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE}"
+
+          # Retry up to 3 times in case HF is briefly slow.
+          for i in 1 2 3; do
+            if git push -f space main; then
+              echo "✓ Deployed successfully to https://huggingface.co/spaces/${HF_SPACE}"
+              exit 0
+            fi
+            echo "↻ Push attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+
+          echo "❌ Could not push to HF after 3 attempts. Check that the token has write access to ${HF_SPACE}."
+          exit 1
