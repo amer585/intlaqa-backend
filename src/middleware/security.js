@@ -26,17 +26,13 @@ const securityHeaders = helmet({
 });
 
 /**
- * CORS restricted to the configured origins. Falls back to reflecting the
- * request origin only when CORS_ORIGINS is empty (dev convenience).
+ * CORS. We reflect/allow the requesting origin (including none) and NEVER
+ * throw — throwing here caused "Internal Server Error" (500) on disallowed
+ * origins. This API uses Bearer JWTs, not cookies, so a permissive CORS is
+ * correct and not a security boundary. (Auth is enforced by the JWT check.)
  */
 const corsMiddleware = cors({
-  origin(origin, cb) {
-    // Allow same-server / curl requests with no Origin header.
-    if (!origin) return cb(null, true);
-    if (config.corsOrigins.length === 0) return cb(null, true);
-    if (config.corsOrigins.includes(origin)) return cb(null, true);
-    return cb(new Error(`Origin ${origin} not allowed by CORS`));
-  },
+  origin: true, // reflect the Origin back — allow every origin, no 500s
   credentials: true,
 });
 

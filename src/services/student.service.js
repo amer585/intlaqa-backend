@@ -8,8 +8,6 @@ const { resolveGovCode, resolveGovName } = require('../utils/governorates');
 const { isDistrictManagerRole, normalizeRole } = require('../utils/roles');
 const { requireFields, assert14DigitSsn, assertGradeLevel, normalizeGender } = require('../utils/validation');
 
-const TEST_SSN = '11111111111111';
-
 /**
  * Student "login" = profile lookup by 14-digit token + grade level.
  * Implements cache-aside: Redis first, libSQL second.
@@ -19,23 +17,6 @@ async function loginStudent(payload = {}) {
   assert14DigitSsn(payload.ssn_encrypted);
   const gradeLevel = assertGradeLevel(payload.grade_level);
   const ssn = String(payload.ssn_encrypted);
-
-  // Demo account, off unless ALLOW_TEST_LOGIN=true.
-  if (ssn === TEST_SSN && config.allowTestLogin) {
-    return {
-      message: 'Login successful',
-      student: {
-        ssn_encrypted: TEST_SSN,
-        grade_level: gradeLevel,
-        student_name_ar: 'طالب تجريبي (حساب مؤقت)',
-        school_name: 'مدرسة الانطلاقة',
-        class_name: 'فصل أ',
-        admin_zone: 'إدارة تجريبية',
-        gov_code: 'القاهرة',
-        gender: 'M',
-      },
-    };
-  }
 
   const dbUrl = getDbUrl(gradeLevel);
   if (!dbUrl) {
