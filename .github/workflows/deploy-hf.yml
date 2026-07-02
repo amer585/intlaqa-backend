@@ -33,6 +33,9 @@ jobs:
           # Put it in whichever tab you like — it will still work.
           HF_SPACE: ${{ vars.HF_SPACE || secrets.HF_SPACE || 'amer21/mcp' }}
         run: |
+          # Strip any stray whitespace (tabs/spaces/newlines) from pasted values.
+          HF_TOKEN="$(printf '%s' "$HF_TOKEN" | tr -d '[:space:]')"
+          HF_SPACE="$(printf '%s' "$HF_SPACE" | tr -d '[:space:]')"
           if [ -z "$HF_TOKEN" ]; then
             echo "FATAL: HF_TOKEN secret is not set. Add it in Settings > Secrets and variables > Actions."
             exit 1
