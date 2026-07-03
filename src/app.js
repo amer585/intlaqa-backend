@@ -70,7 +70,9 @@ function createApp() {
   app.use('/api', createApiRouter());
 
   // ── Serve the built frontend (SPA) ─────────────────────────
-  if (HAS_FRONTEND) {
+  if (process.env.VITE_DEV === 'true') {
+    // Vite middleware will handle it in server.ts
+  } else if (HAS_FRONTEND) {
     // Static assets with long cache.
     app.use(express.static(PUBLIC_DIR, { maxAge: '1y', index: false }));
     // SPA fallback: any non-/api GET returns index.html (client-side routing).
@@ -78,10 +80,18 @@ function createApp() {
       res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
     });
   } else {
-    // Fallback when no frontend build is present (e.g. backend-only deploy).
-    app.get('/', (_req, res) => {
-      res.json({ status: 'ok', service: 'Intlaqa / Madrastna API v3', frontend: 'not built' });
-    });
+    // Fallback when no frontend build is present — check root dist
+    const rootDist = path.join(process.cwd(), 'dist');
+    if (fs.existsSync(path.join(rootDist, 'index.html'))) {
+      app.use(express.static(rootDist, { maxAge: '1y', index: false }));
+      app.get(/^(?!\/api|\/health).*/, (_req, res) => {
+        res.sendFile(path.join(rootDist, 'index.html'));
+      });
+    } else {
+      app.get('/', (_req, res) => {
+        res.json({ status: 'ok', service: 'Intlaqa / Madrastna API v3', frontend: 'not built' });
+      });
+    }
   }
 
   app.use(errorHandler);
