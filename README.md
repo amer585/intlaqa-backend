@@ -1,3 +1,12 @@
+---
+title: Intlaqa Backend
+emoji: 🚀
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+pinned: false
+---
+
 # Intlaqa / Madrastna — Backend v4
 
 ![Express](https://img.shields.io/badge/Express-4-black) ![Node](https://img.shields.io/badge/Node-20-green) ![Turso/libSQL](https://img.shields.io/badge/DB-Turso%20libSQL-blue)
