@@ -4,6 +4,7 @@ const { createClient } = require('@libsql/client');
 const path = require('path');
 const fs = require('fs');
 const logger = require('../lib/logger');
+const { redisEnabled, redisGet, redisSetEx, redisDel } = require('./redis');
 
 // Default TTL: 5 minutes. Pass 0 (or NEVER_EXPIRES) for entries that should
 // persist until explicitly invalidated by a write — they survive restarts and
@@ -66,6 +67,16 @@ function getCache(key) {
  * @returns {Promise<unknown | null>}
  */
 async function getCacheAsync(key) {
+  if (redisEnabled) {
+    try {
+      const cached = await redisGet(key);
+      if (cached) {
+        return JSON.parse(cached);
+      }
+    } catch {
+      // Degrade to local / Turso
+    }
+  }
   if (!enabled || !client) return null;
   try {
     const now = Math.floor(Date.now() / 1000);
@@ -95,6 +106,14 @@ async function getCacheAsync(key) {
  * @param {number} [ttlSec]
  */
 async function setCache(key, value, ttlSec = DEFAULT_TTL_SEC) {
+  if (redisEnabled) {
+    try {
+      const finalTtl = ttlSec && ttlSec > 0 ? ttlSec : 365 * 24 * 60 * 60; // 1 year for persistent portal cache
+      await redisSetEx(key, finalTtl, JSON.stringify(value));
+    } catch {
+      // non-fatal
+    }
+  }
   if (!enabled || !client) return;
   try {
     // 0 (or any falsy) = never expire — kept until a write explicitly invalidates it.
@@ -139,6 +158,13 @@ async function clearAll() {
  * @param {string} key
  */
 async function invalidate(key) {
+  if (redisEnabled) {
+    try {
+      await redisDel(key);
+    } catch {
+      // non-fatal
+    }
+  }
   if (!enabled || !client) return;
   try {
     await client.execute({ sql: 'DELETE FROM cache_kv WHERE key = ?', args: [key] });
