@@ -2,587 +2,346 @@
 
 const logger = require('../lib/logger');
 
+// Bump when the schema/migration changes. The expensive one-time data
+// explosion only runs while this version marker is absent from portal_meta.
+const SCHEMA_VERSION = '4';
+
+/** @typedef {{ execute: (q: { sql: string; args?: unknown[] }) => Promise<{ rows: Record<string, unknown>[]; rowsAffected: number; lastInsertRowid: number | bigint }>, batch: (stmts: { sql: string; args?: unknown[] }[], mode?: 'read'|'write'|'deferred') => Promise<any[]> }} RawDb */
+
+/** Thin helper so we always pass {sql,args}. @param {RawDb} db */
+const exec = (db, sql, args = []) => db.execute({ sql, args });
+
+// ── DDL (kept identical to schema.sql; duplicated so a fresh boot self-creates) ──
+const STUDENT_DDL = [
+  `CREATE TABLE IF NOT EXISTS governorates (
+     gov_code TEXT PRIMARY KEY, name_ar TEXT NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS schools (
+     school_id INTEGER PRIMARY KEY AUTOINCREMENT,
+     gov_code TEXT NOT NULL, admin_zone TEXT NOT NULL, school_name TEXT NOT NULL,
+     created_at TEXT NOT NULL DEFAULT (datetime('now')),
+     UNIQUE (gov_code, admin_zone, school_name)
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_schools_zone ON schools (admin_zone, school_name)`,
+  `CREATE INDEX IF NOT EXISTS idx_schools_gov  ON schools (gov_code)`,
+  `CREATE TABLE IF NOT EXISTS staff (
+     staff_id INTEGER PRIMARY KEY AUTOINCREMENT,
+     username TEXT NOT NULL UNIQUE,
+     password_hash TEXT NOT NULL,
+     display_name TEXT,
+     role TEXT NOT NULL DEFAULT 'teacher',
+     gov_code TEXT,
+     admin_zone TEXT NOT NULL DEFAULT 'ALL',
+     school_name TEXT NOT NULL DEFAULT 'ALL',
+     is_active INTEGER NOT NULL DEFAULT 1,
+     created_at TEXT NOT NULL DEFAULT (datetime('now')),
+     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_staff_school ON staff (school_name)`,
+  `CREATE INDEX IF NOT EXISTS idx_staff_zone   ON staff (admin_zone)`,
+  `CREATE TABLE IF NOT EXISTS students (
+     ssn_encrypted TEXT PRIMARY KEY,
+     student_name_ar TEXT,
+     gender TEXT CHECK (gender IS NULL OR gender IN ('M','F')),
+     gov_code TEXT, admin_zone TEXT, school_name TEXT,
+     grade_level INTEGER NOT NULL CHECK (grade_level BETWEEN 1 AND 12),
+     class_name TEXT,
+     created_at TEXT NOT NULL DEFAULT (datetime('now')),
+     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_students_class
+     ON students (school_name, grade_level, class_name, admin_zone)`,
+  // student_grades / attendance / weekly are created AFTER legacy renames below.
+  `CREATE TABLE IF NOT EXISTS teacher_classes (
+     teacher_id INTEGER NOT NULL, grade_level INTEGER NOT NULL,
+     class_name TEXT NOT NULL, subject_name TEXT NOT NULL,
+     PRIMARY KEY (teacher_id, grade_level, class_name, subject_name)
+   )`,
+  `CREATE TABLE IF NOT EXISTS activity_logs (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     ssn_encrypted TEXT NOT NULL, action_type INTEGER NOT NULL, metadata TEXT,
+     logged_at TEXT NOT NULL DEFAULT (datetime('now'))
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_logs_ssn_time ON activity_logs (ssn_encrypted, logged_at DESC)`,
+  `CREATE TABLE IF NOT EXISTS portal_meta (
+     key TEXT PRIMARY KEY, value TEXT NOT NULL,
+     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+   )`,
+];
+
+const NEW_GRADE_DDL = [
+  `CREATE TABLE IF NOT EXISTS student_grades (
+     ssn_encrypted TEXT NOT NULL, subject_name TEXT NOT NULL, grade_value TEXT NOT NULL,
+     updated_by INTEGER, updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+     PRIMARY KEY (ssn_encrypted, subject_name)
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_grades_cover
+     ON student_grades (ssn_encrypted, subject_name, grade_value, updated_by, updated_at)`,
+];
+const NEW_ATTENDANCE_DDL = [
+  `CREATE TABLE IF NOT EXISTS attendance (
+     ssn_encrypted TEXT NOT NULL, date TEXT NOT NULL,
+     status TEXT NOT NULL CHECK (status IN ('present','absent','late','excused')),
+     note TEXT, PRIMARY KEY (ssn_encrypted, date)
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_attendance_ssn ON attendance (ssn_encrypted)`,
+];
+const NEW_WEEKLY_DDL = [
+  `CREATE TABLE IF NOT EXISTS weekly_assessments (
+     ssn_encrypted TEXT NOT NULL, subject_name TEXT NOT NULL, week_number INTEGER NOT NULL,
+     score REAL NOT NULL, max_score REAL NOT NULL DEFAULT 10,
+     PRIMARY KEY (ssn_encrypted, subject_name, week_number)
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_weekly_ssn ON weekly_assessments (ssn_encrypted)`,
+];
+
+const TRIGGER_DDL = [
+  `DROP TRIGGER IF EXISTS staff_updated_at`,
+  `CREATE TRIGGER staff_updated_at AFTER UPDATE ON staff
+     FOR EACH ROW WHEN NEW.updated_at = OLD.updated_at
+     BEGIN UPDATE staff SET updated_at = datetime('now') WHERE rowid = NEW.rowid; END`,
+  `DROP TRIGGER IF EXISTS students_updated_at`,
+  `CREATE TRIGGER students_updated_at AFTER UPDATE ON students
+     FOR EACH ROW WHEN NEW.updated_at = OLD.updated_at
+     BEGIN UPDATE students SET updated_at = datetime('now') WHERE rowid = NEW.rowid; END`,
+];
+
+const TEACHER_DDL = [
+  `CREATE TABLE IF NOT EXISTS teacher_accounts (
+     id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
+     password_hash TEXT NOT NULL, phone TEXT, subject TEXT,
+     is_verified INTEGER NOT NULL DEFAULT 0,
+     created_at TEXT NOT NULL DEFAULT (datetime('now')),
+     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_ta_pending ON teacher_accounts (is_verified, created_at)`,
+  `CREATE TABLE IF NOT EXISTS teacher_student_relations (
+     teacher_id TEXT NOT NULL, student_id TEXT NOT NULL,
+     created_at TEXT NOT NULL DEFAULT (datetime('now')),
+     PRIMARY KEY (teacher_id, student_id)
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_tsr_student ON teacher_student_relations (student_id)`,
+  `DROP TRIGGER IF EXISTS teacher_accounts_updated_at`,
+  `CREATE TRIGGER teacher_accounts_updated_at AFTER UPDATE ON teacher_accounts
+     FOR EACH ROW WHEN NEW.updated_at = OLD.updated_at
+     BEGIN UPDATE teacher_accounts SET updated_at = datetime('now') WHERE id = NEW.id; END`,
+];
+
+// ── introspection helpers ──────────────────────────────────────
+async function tableExists(db, name) {
+  const { rows } = await exec(db, `SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`, [name]);
+  return rows.length > 0;
+}
+async function columnsOf(db, name) {
+  const { rows } = await exec(db, `PRAGMA table_info("${name}")`);
+  return rows.map((r) => String(r.name));
+}
+async function getMeta(db, key) {
+  try {
+    const { rows } = await exec(db, `SELECT value FROM portal_meta WHERE key=?`, [key]);
+    return rows.length ? String(rows[0].value) : null;
+  } catch { return null; }
+}
+async function setMeta(db, key, value) {
+  await exec(db, `INSERT INTO portal_meta(key,value,updated_at) VALUES(?,?,datetime('now'))
+                  ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')`, [key, String(value)]);
+}
+function parseJson(raw, fallback) {
+  try { return typeof raw === 'string' && raw ? JSON.parse(raw) : fallback; }
+  catch { return fallback; }
+}
+
 /**
- * Idempotent schema bootstrap for Turso/libSQL (SQLite). Runs on every boot
- * via CREATE TABLE IF NOT EXISTS so a fresh database just works.
- * @param {{ execute: (sql: string, args?: unknown[]) => Promise<unknown> }} db
+ * If a legacy table (old shape) occupies a name we now use, rename it aside so
+ * the new-shape CREATE can proceed. Detection by a column that only the old
+ * shape has (e.g. 'grade_level' on student_grades, 'id' on attendance/weekly).
+ * @param {RawDb} db @param {string} table @param {string} legacyMarkerCol
+ */
+async function renameLegacyShape(db, table, legacyMarkerCol) {
+  if (!(await tableExists(db, table))) return false;
+  const cols = await columnsOf(db, table);
+  if (!cols.includes(legacyMarkerCol)) return false; // already new-shape (or compatible)
+  const legacy = `${table}_legacy`;
+  await exec(db, `ALTER TABLE "${table}" RENAME TO "${legacy}"`);
+  logger.info('Renamed legacy table aside', { from: table, to: legacy });
+  return true;
+}
+
+/** Seed the governorates reference table (27 governorates). @param {RawDb} db */
+async function seedGovernorates(db) {
+  const { GOVERNORATES } = require('../utils/governorates');
+  const rows = GOVERNORATES.map((g) => ({ sql: `INSERT OR IGNORE INTO governorates(gov_code,name_ar) VALUES(?,?)`, args: [g.code, g.name] }));
+  await db.batch(rows, 'write');
+}
+
+/** Back-fill the schools dimension table from students + staff. @param {RawDb} db */
+async function backfillSchools(db) {
+  await exec(db, `INSERT OR IGNORE INTO schools(gov_code,admin_zone,school_name)
+      SELECT DISTINCT COALESCE(gov_code,''), COALESCE(admin_zone,''), school_name
+        FROM students
+       WHERE school_name IS NOT NULL AND school_name <> 'ALL' AND COALESCE(admin_zone,'') <> ''`);
+  await exec(db, `INSERT OR IGNORE INTO schools(gov_code,admin_zone,school_name)
+      SELECT DISTINCT COALESCE(gov_code,''), COALESCE(admin_zone,''), school_name
+        FROM staff
+       WHERE school_name IS NOT NULL AND school_name <> 'ALL' AND COALESCE(admin_zone,'') <> ''`);
+}
+
+/** Copy the legacy `teachers` table into `staff` (id-preserving), then drop it. @param {RawDb} db */
+async function migrateTeachersToStaff(db) {
+  if (!(await tableExists(db, 'teachers'))) return;
+  try {
+    await exec(db, `INSERT OR IGNORE INTO staff
+        (staff_id, username, password_hash, display_name, role, gov_code, admin_zone, school_name, is_active, created_at, updated_at)
+        SELECT teacher_id, username, password_hash, teacher_name_ar, role, gov_code, admin_zone, school_name,
+               COALESCE(is_active,1), created_at, updated_at FROM teachers`);
+    logger.info('Migrated teachers → staff', {});
+    await exec(db, `DROP TABLE teachers`);
+  } catch (error) {
+    logger.warn('teachers→staff migration step skipped', { message: error.message });
+  }
+}
+
+/** Copy renamed legacy normalized tables into the new tables. @param {RawDb} db */
+async function copyLegacyTables(db) {
+  if (await tableExists(db, 'student_grades_legacy')) {
+    try {
+      await exec(db, `INSERT OR IGNORE INTO student_grades(ssn_encrypted,subject_name,grade_value)
+          SELECT ssn_encrypted, subject_name, grade_value FROM student_grades_legacy
+           WHERE subject_name IS NOT NULL AND grade_value IS NOT NULL`);
+    } catch (error) { logger.warn('legacy student_grades copy skipped', { message: error.message }); }
+  }
+  if (await tableExists(db, 'student_attendance_legacy')) {
+    try {
+      await exec(db, `INSERT OR IGNORE INTO attendance(ssn_encrypted,date,status,note)
+          SELECT ssn_encrypted, date, status, note FROM student_attendance_legacy
+           WHERE status IN ('present','absent','late','excused')`);
+    } catch (error) { logger.warn('legacy attendance copy skipped', { message: error.message }); }
+  }
+  if (await tableExists(db, 'weekly_assessments_legacy')) {
+    try {
+      await exec(db, `INSERT OR IGNORE INTO weekly_assessments(ssn_encrypted,subject_name,week_number,score,max_score)
+          SELECT ssn_encrypted, subject_name, week_number, score, COALESCE(max_score,10)
+            FROM weekly_assessments_legacy`);
+    } catch (error) { logger.warn('legacy weekly copy skipped', { message: error.message }); }
+  }
+}
+
+/**
+ * Explode the legacy v3 JSON columns (grades_json / attendance_json /
+ * weekly_json) on each students row into the normalized tables. Idempotent via
+ * INSERT OR IGNORE. Uses one batch per student.
+ * @param {RawDb} db
+ */
+async function explodeStudentJson(db) {
+  const { rows } = await exec(db, `SELECT ssn_encrypted, grades_json, attendance_json, weekly_json FROM students`);
+  let students = rows.length;
+  let grades = 0, attendance = 0, weekly = 0;
+  const STATUS = new Set(['present', 'absent', 'late', 'excused']);
+  for (const r of rows) {
+    /** @type {{sql:string,args:any[]}[]} */
+    const stmts = [];
+    const ssn = String(r.ssn_encrypted);
+
+    const gradesObj = parseJson(r.grades_json, {});
+    if (gradesObj && typeof gradesObj === 'object') {
+      for (const [subject, value] of Object.entries(gradesObj)) {
+        if (subject && value !== null && value !== undefined && value !== '') {
+          stmts.push({ sql: `INSERT OR IGNORE INTO student_grades(ssn_encrypted,subject_name,grade_value) VALUES(?,?,?)`, args: [ssn, String(subject), String(value)] });
+          grades++;
+        }
+      }
+    }
+    const attendanceArr = parseJson(r.attendance_json, []);
+    if (Array.isArray(attendanceArr)) {
+      for (const a of attendanceArr) {
+        const status = String(a && a.status || '').toLowerCase();
+        const date = a && a.date ? String(a.date) : null;
+        if (date && STATUS.has(status)) {
+          stmts.push({ sql: `INSERT OR IGNORE INTO attendance(ssn_encrypted,date,status,note) VALUES(?,?,?,?)`, args: [ssn, date, status, a.note ? String(a.note) : null] });
+          attendance++;
+        }
+      }
+    }
+    const weeklyObj = parseJson(r.weekly_json, {});
+    if (weeklyObj && typeof weeklyObj === 'object') {
+      for (const [subject, arr] of Object.entries(weeklyObj)) {
+        if (Array.isArray(arr)) {
+          for (const w of arr) {
+            const week = Number(w && w.week);
+            const score = Number(w && w.score);
+            if (subject && Number.isInteger(week) && Number.isFinite(score)) {
+              stmts.push({ sql: `INSERT OR IGNORE INTO weekly_assessments(ssn_encrypted,subject_name,week_number,score,max_score) VALUES(?,?,?,?,?)`,
+                args: [ssn, String(subject), week, score, Number.isFinite(Number(w.max_score)) ? Number(w.max_score) : 10] });
+              weekly++;
+            }
+          }
+        }
+      }
+    }
+    if (stmts.length > 0) {
+      try { await db.batch(stmts, 'write'); } catch (error) { logger.warn('JSON explode batch failed for student', { ssn, message: error.message }); }
+    }
+  }
+  logger.info('Exploded legacy student JSON into normalized tables', { students, grades, attendance, weekly });
+}
+
+/** Seed default schedule/announcements blobs only if absent. @param {RawDb} db */
+async function seedPortalMetaDefaults(db) {
+  await exec(db, `INSERT OR IGNORE INTO portal_meta(key,value,updated_at) VALUES('announcements','[]',datetime('now'))`);
+  for (let g = 1; g <= 12; g++) {
+    await exec(db, `INSERT OR IGNORE INTO portal_meta(key,value,updated_at) VALUES(?,'{}',datetime('now'))`, [`schedule:${g}`]);
+  }
+}
+
+/**
+ * Full student-DB migration. Idempotent + safe. Never throws (logs + continues).
+ * @param {RawDb} db
  */
 async function runMigrations(db) {
-  const statements = [
-    `CREATE TABLE IF NOT EXISTS teachers (
-       teacher_id      INTEGER PRIMARY KEY AUTOINCREMENT,
-       username        TEXT NOT NULL UNIQUE,
-       password_hash   TEXT NOT NULL,
-       teacher_name_ar TEXT,
-       role            TEXT NOT NULL DEFAULT 'teacher',
-       gov_code        TEXT,
-       admin_zone      TEXT DEFAULT 'ALL',
-       school_name     TEXT DEFAULT 'ALL',
-       is_active       INTEGER NOT NULL DEFAULT 1,
-       created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-       updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
-     )`,
-    `CREATE TABLE IF NOT EXISTS students (
-       ssn_encrypted   TEXT PRIMARY KEY,
-       student_name_ar TEXT,
-       gender          TEXT,
-       gov_code        TEXT,
-       admin_zone      TEXT,
-       school_name     TEXT,
-       grade_level     INTEGER NOT NULL,
-       class_name      TEXT,
-       grades_json     TEXT DEFAULT '{}',
-       attendance_json TEXT DEFAULT '[]',
-       weekly_json     TEXT DEFAULT '{}',
-       created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-       updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
-     )`,
-    `CREATE INDEX IF NOT EXISTS idx_class_lookup
-       ON students (school_name, grade_level, class_name, admin_zone)`,
-    `CREATE TABLE IF NOT EXISTS student_grades (
-       grade_id      INTEGER PRIMARY KEY AUTOINCREMENT,
-       ssn_encrypted TEXT NOT NULL,
-       grade_level   INTEGER NOT NULL,
-       class_name    TEXT NOT NULL,
-       subject_name  TEXT NOT NULL,
-       grade_value   TEXT,
-       teacher_id    INTEGER,
-       created_at    TEXT NOT NULL DEFAULT (datetime('now')),
-       updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
-     )`,
-    `CREATE UNIQUE INDEX IF NOT EXISTS uq_student_grade_scope
-       ON student_grades (ssn_encrypted, grade_level, class_name, subject_name)`,
-    `CREATE INDEX IF NOT EXISTS idx_grade_roster_lookup
-       ON student_grades (grade_level, class_name, ssn_encrypted)`,
-    `CREATE TABLE IF NOT EXISTS activity_logs (
-       id            INTEGER PRIMARY KEY AUTOINCREMENT,
-       ssn_encrypted TEXT NOT NULL,
-       action_type   INTEGER NOT NULL,
-       metadata      TEXT,
-       logged_at     TEXT NOT NULL DEFAULT (datetime('now'))
-     )`,
-    `CREATE INDEX IF NOT EXISTS idx_ssn_time
-       ON activity_logs (ssn_encrypted, logged_at DESC)`,
-    `CREATE TABLE IF NOT EXISTS teacher_classes (
-       id           INTEGER PRIMARY KEY AUTOINCREMENT,
-       teacher_id   INTEGER NOT NULL,
-       grade_level  INTEGER NOT NULL,
-       class_name   TEXT NOT NULL,
-       subject_name TEXT NOT NULL
-     )`,
-    `CREATE UNIQUE INDEX IF NOT EXISTS uq_assignment
-       ON teacher_classes (teacher_id, grade_level, class_name, subject_name)`,
-    `CREATE INDEX IF NOT EXISTS idx_class_subject
-       ON teacher_classes (grade_level, class_name, subject_name)`,
-
-    // NOTE: teacher_accounts + teacher_student_relations now live in the
-    // SEPARATE teacher database (see runTeacherMigrations below), NOT here.
-    // This keeps the two Turso accounts isolated.
-
-    // ── Weekly assessments (التقديرات الأسبوعية) ─────────────
-    `CREATE TABLE IF NOT EXISTS weekly_assessments (
-       id            INTEGER PRIMARY KEY AUTOINCREMENT,
-       ssn_encrypted TEXT NOT NULL,
-       subject_name  TEXT NOT NULL,
-       week_number   INTEGER NOT NULL,
-       score         REAL NOT NULL,
-       max_score     REAL DEFAULT 10,
-       UNIQUE(ssn_encrypted, subject_name, week_number)
-     )`,
-    `CREATE INDEX IF NOT EXISTS idx_wa_ssn
-       ON weekly_assessments (ssn_encrypted, week_number)`,
-
-    // ── Portal meta (replaces the old announcements + class_schedule tables)
-    // Key/value blob store. The ENTIRE weekly schedule for a grade is ONE row
-    // (key 'schedule:7') and all announcements are ONE row (key 'announcements').
-    // This collapses the portal read from ~38 rows (per-day/per-period schedule
-    // + per-announcement rows) down to exactly TWO rows.
-    `CREATE TABLE IF NOT EXISTS portal_meta (
-       key        TEXT PRIMARY KEY,
-       value      TEXT NOT NULL,
-       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-     )`,
-    // Legacy tables kept declared here ONLY so a fresh boot can migrate any
-    // data out of them; they are dropped after migration (see dropLegacyPortalTables).
-
-    // updated_at triggers (SQLite pattern: DROP then CREATE).
-    `DROP TRIGGER IF EXISTS teachers_updated_at`,
-    `CREATE TRIGGER teachers_updated_at AFTER UPDATE ON teachers
-       FOR EACH ROW WHEN NEW.updated_at = OLD.updated_at
-       BEGIN UPDATE teachers SET updated_at = datetime('now') WHERE rowid = NEW.rowid; END`,
-    `DROP TRIGGER IF EXISTS students_updated_at`,
-    `CREATE TRIGGER students_updated_at AFTER UPDATE ON students
-       FOR EACH ROW WHEN NEW.updated_at = OLD.updated_at
-       BEGIN UPDATE students SET updated_at = datetime('now') WHERE rowid = NEW.rowid; END`,
-    `DROP TRIGGER IF EXISTS student_grades_updated_at`,
-    `CREATE TRIGGER student_grades_updated_at AFTER UPDATE ON student_grades
-       FOR EACH ROW WHEN NEW.updated_at = OLD.updated_at
-       BEGIN UPDATE student_grades SET updated_at = datetime('now') WHERE rowid = NEW.rowid; END`,
-  ];
-
-  for (const sql of statements) {
-    await db.execute(sql);
-  }
-  logger.info('Database schema ready (Turso/libSQL)', { statements: statements.length });
-
-  // Refresh the query-planner statistics so reads pick the optimal index.
-  try { await db.execute('ANALYZE'); } catch { /* non-fatal on some backends */ }
-
-  // Ensure existing students table has the JSON columns (ALTER is a no-op if
-  // the column already exists; we guard with try/catch since SQLite lacks
-  // ADD COLUMN IF NOT EXISTS).
-  for (const [col, def] of [['grades_json', 'TEXT DEFAULT "{}"'], ['attendance_json', 'TEXT DEFAULT "[]"'], ['weekly_json', 'TEXT DEFAULT "{}"']]) {
-    try {
-      await db.execute(`ALTER TABLE students ADD COLUMN ${col} ${def}`);
-      logger.info('Added column to students', { column: col });
-    } catch {
-      // Column already exists — expected on subsequent boots.
-    }
-  }
-
-  // Migrate legacy tables into the single-row JSON columns.
-  await migrateGradesToJson(db);
-  await migrateAttendanceToJson(db);
-  await migrateWeeklyToJson(db);
-
-  // Drop legacy tables that are now fully replaced by JSON columns.
-  await dropLegacyTables(db);
-
-  // Migrate legacy schedule/announcements tables into portal_meta, then drop
-  // them. Seeds defaults if nothing exists yet.
-  await restructurePortalMeta(db);
-  await seedStudentJsonDefaults(db);
-}
-
-/**
- * Drop legacy tables replaced by JSON columns. Safe because all data has been
- * migrated into students.grades_json / attendance_json / weekly_json.
- */
-async function dropLegacyTables(db) {
-  for (const table of ['student_grades', 'student_attendance', 'weekly_assessments']) {
-    try {
-      await db.execute(`DROP TABLE IF EXISTS ${table}`);
-      logger.info('Dropped legacy table', { table });
-    } catch {
-      /* ignore — table may not exist */
-    }
-  }
-}
-
-/**
- * Migrate legacy student_attendance rows into students.attendance_json.
- */
-async function migrateAttendanceToJson(db) {
   try {
-    const { rows } = await db.execute(
-      `SELECT s.ssn_encrypted, sa.date, sa.status, sa.note
-         FROM students s
-         JOIN student_attendance sa ON sa.ssn_encrypted = s.ssn_encrypted
-        WHERE COALESCE(s.attendance_json, '') = '' OR s.attendance_json = '[]'
-        ORDER BY s.ssn_encrypted, sa.date DESC`,
-    );
-    if (rows.length === 0) return;
+    // 1. Rename any old-shape tables that collide with new names, BEFORE creating.
+    await renameLegacyShape(db, 'student_grades', 'grade_level');
+    await renameLegacyShape(db, 'attendance', 'id');
+    await renameLegacyShape(db, 'weekly_assessments', 'id');
 
-    /** @type {Record<string, Array<{date:string,status:string,note:string|null}>>} */
-    const byStudent = {};
-    for (const row of rows) {
-      if (!byStudent[row.ssn_encrypted]) byStudent[row.ssn_encrypted] = [];
-      byStudent[row.ssn_encrypted].push({
-        date: row.date,
-        status: row.status,
-        note: row.note,
-      });
+    // 2. Create the new schema (IF NOT EXISTS).
+    for (const sql of [...STUDENT_DDL, ...NEW_GRADE_DDL, ...NEW_ATTENDANCE_DDL, ...NEW_WEEKLY_DDL, ...TRIGGER_DDL]) {
+      await exec(db, sql);
+    }
+    await seedGovernorates(db);
+
+    const version = await getMeta(db, 'schema_version');
+    const firstRun = version !== SCHEMA_VERSION;
+
+    // Copy aside any legacy normalized tables into the new ones.
+    await copyLegacyTables(db);
+
+    if (firstRun) {
+      logger.info(`Running v${SCHEMA_VERSION} one-time data migration`, { previous: version });
+      await migrateTeachersToStaff(db);
+      await backfillSchools(db);
+      await explodeStudentJson(db);
+      await seedPortalMetaDefaults(db);
+      await setMeta(db, 'schema_version', SCHEMA_VERSION);
+      logger.info(`Schema v${SCHEMA_VERSION} migration complete`, {});
     }
 
-    let migrated = 0;
-    for (const [ssn, records] of Object.entries(byStudent)) {
-      await db.execute({
-        sql: 'UPDATE students SET attendance_json = ? WHERE ssn_encrypted = ?',
-        args: [JSON.stringify(records), ssn],
-      });
-      migrated++;
-    }
-    logger.info('Migrated attendance into attendance_json', { students: migrated, records: rows.length });
-  } catch {
-    // Table may not exist yet — skip silently.
-  }
-}
-
-/**
- * Migrate legacy weekly_assessments rows into students.weekly_json.
- */
-async function migrateWeeklyToJson(db) {
-  try {
-    const { rows } = await db.execute(
-      `SELECT s.ssn_encrypted, wa.subject_name, wa.week_number, wa.score, wa.max_score
-         FROM students s
-         JOIN weekly_assessments wa ON wa.ssn_encrypted = s.ssn_encrypted
-        WHERE COALESCE(s.weekly_json, '') = '' OR s.weekly_json = '{}'
-        ORDER BY s.ssn_encrypted, wa.subject_name, wa.week_number`,
-    );
-    if (rows.length === 0) return;
-
-    /** @type {Record<string, Record<string, Array<{week:number,score:number,max_score:number}>>>} */
-    const byStudent = {};
-    for (const row of rows) {
-      if (!byStudent[row.ssn_encrypted]) byStudent[row.ssn_encrypted] = {};
-      const subj = row.subject_name;
-      if (!byStudent[row.ssn_encrypted][subj]) byStudent[row.ssn_encrypted][subj] = [];
-      byStudent[row.ssn_encrypted][subj].push({
-        week: row.week_number,
-        score: row.score,
-        max_score: row.max_score,
-      });
-    }
-
-    let migrated = 0;
-    for (const [ssn, weekly] of Object.entries(byStudent)) {
-      await db.execute({
-        sql: 'UPDATE students SET weekly_json = ? WHERE ssn_encrypted = ?',
-        args: [JSON.stringify(weekly), ssn],
-      });
-      migrated++;
-    }
-    logger.info('Migrated weekly assessments into weekly_json', { students: migrated });
-  } catch {
-    // Table may not exist yet — skip silently.
-  }
-}
-
-/**
- * Seed default JSON data for students that have no grades/attendance/weekly yet.
- * Only runs for students that exist but have empty JSON columns.
- */
-async function seedStudentJsonDefaults(db) {
-  try {
-    // Find the demo student with empty weekly_json
-    const { rows } = await db.execute(
-      `SELECT ssn_encrypted FROM students WHERE COALESCE(weekly_json,'') = '' OR weekly_json = '{}'`,
-    );
-    if (rows.length === 0) return;
-
-    const subjects = [
-      { name: 'اللغة العربية', base: 7.5 },
-      { name: 'اللغة الإنجليزية', base: 7.0 },
-      { name: 'الرياضيات', base: 8.5 },
-      { name: 'العلوم', base: 8.0 },
-      { name: 'الدراسات الاجتماعية', base: 8.2 },
-      { name: 'التربية الدينية', base: 9.0 },
-      { name: 'الحاسب الآلي', base: 9.2 },
-    ];
-
-    // Build weekly assessment JSON: { subject: [{week, score, max_score}] }
-    const weekly = {};
-    for (const subj of subjects) {
-      weekly[subj.name] = [];
-      for (let week = 1; week <= 12; week++) {
-        const variance = Math.sin(week * 1.3 + subj.base) * 1.2;
-        const score = Math.min(10, Math.max(4, subj.base + variance + (week * 0.1)));
-        weekly[subj.name].push({ week, score: Math.round(score * 10) / 10, max_score: 10 });
-      }
-    }
-
-    // Build attendance JSON
-    const attendance = [];
-    const statuses = ['present','present','present','present','present','present','present','present','present','present','present','present','present','present','present','present','present','late','present','absent'];
-    const today = new Date();
-    let dayCount = 0;
-    for (let i = 0; i < 40 && dayCount < 20; i++) {
-      const d = new Date(today);
-      d.setDate(d.getDate() - i);
-      const dow = d.getDay();
-      if (dow === 5 || dow === 6) continue;
-      attendance.push({
-        date: d.toISOString().slice(0, 10),
-        status: statuses[dayCount],
-        note: statuses[dayCount] === 'late' ? 'تأخير 15 دقيقة' : statuses[dayCount] === 'absent' ? 'غياب بدون عذر' : null,
-      });
-      dayCount++;
-    }
-
-    for (const row of rows) {
-      await db.execute({
-        sql: 'UPDATE students SET weekly_json = ?, attendance_json = ? WHERE ssn_encrypted = ?',
-        args: [JSON.stringify(weekly), JSON.stringify(attendance), row.ssn_encrypted],
-      });
-    }
-    logger.info('Seeded weekly + attendance JSON for students', { count: rows.length });
-  } catch {
-    /* ignore */
-  }
-}
-
-/**
- * Migrate legacy student_grades rows (one per subject) into the new
- * students.grades_json column (one column holding all subjects as JSON).
- * Idempotent: only migrates students whose grades_json is empty/missing.
- */
-async function migrateGradesToJson(db) {
-  try {
-    // Find students with empty grades_json that have legacy grade rows.
-    const { rows } = await db.execute(
-      `SELECT s.ssn_encrypted, sg.subject_name, sg.grade_value
-         FROM students s
-         JOIN student_grades sg ON sg.ssn_encrypted = s.ssn_encrypted
-        WHERE COALESCE(s.grades_json, '') = '' OR s.grades_json = '{}'
-        ORDER BY s.ssn_encrypted`,
-    );
-
-    if (rows.length === 0) return; // nothing to migrate
-
-    // Group by student SSN.
-    /** @type {Record<string, Record<string, string>>} */
-    const byStudent = {};
-    for (const row of rows) {
-      if (!byStudent[row.ssn_encrypted]) byStudent[row.ssn_encrypted] = {};
-      byStudent[row.ssn_encrypted][row.subject_name] = String(row.grade_value);
-    }
-
-    let migrated = 0;
-    for (const [ssn, grades] of Object.entries(byStudent)) {
-      await db.execute({
-        sql: 'UPDATE students SET grades_json = ? WHERE ssn_encrypted = ?',
-        args: [JSON.stringify(grades), ssn],
-      });
-      migrated++;
-    }
-    logger.info('Migrated legacy grades into grades_json', { students: migrated, rows: rows.length });
+    // Refresh planner stats so reads pick the optimal index.
+    try { await exec(db, 'ANALYZE'); } catch { /* non-fatal */ }
+    logger.info('Student database schema ready', { version: SCHEMA_VERSION });
   } catch (error) {
-    logger.warn('Grade migration skipped', { message: error.message });
+    logger.error('Student migration error', { message: error.message, stack: error.stack });
   }
 }
 
-/**
- * Restructure the portal's shared data (schedule + announcements) from bulky
- * per-row tables into a single lean portal_meta(key,value) blob store.
- *
- *   - class_schedule (one row per day/period) → portal_meta['schedule:GRADE']
- *     = ONE JSON row holding the whole week, grouped by day.
- *   - announcements (one row each)            → portal_meta['announcements']
- *     = ONE JSON row holding the array.
- *
- * Idempotent: guarded by existence checks, so re-running is a no-op. After
- * migrating, the legacy tables are dropped. Seeds defaults if nothing exists.
- */
-async function restructurePortalMeta(db) {
-  // 1. Migrate any existing class_schedule rows into portal_meta (grouped JSON).
-  try {
-    const { rows: grades } = await db.execute('SELECT DISTINCT grade_level FROM class_schedule');
-    for (const g of grades) {
-      const gradeLevel = Number(g.grade_level);
-      const key = `schedule:${gradeLevel}`;
-      const have = await db.execute('SELECT 1 FROM portal_meta WHERE key = ? LIMIT 1', [key]);
-      if (have.rows.length > 0) continue; // already migrated
-      const { rows: sched } = await db.execute(
-        `SELECT day, period, start_time, end_time, subject_name, teacher_name
-           FROM class_schedule WHERE grade_level = ? ORDER BY day, period`,
-        [gradeLevel],
-      );
-      const grouped = {};
-      for (const r of sched) {
-        if (!grouped[r.day]) grouped[r.day] = [];
-        grouped[r.day].push({
-          period: Number(r.period),
-          start_time: r.start_time,
-          end_time: r.end_time,
-          subject_name: r.subject_name,
-          teacher_name: r.teacher_name,
-        });
-      }
-      await db.execute(
-        'INSERT INTO portal_meta (key, value) VALUES (?, ?)',
-        [key, JSON.stringify(grouped)],
-      );
-      logger.info('Migrated schedule → portal_meta', { grade: gradeLevel, rows: sched.length });
-    }
-  } catch {
-    // class_schedule may not exist on a fresh DB — ignore.
-  }
-
-  // 2. Migrate any existing announcements into a single portal_meta row.
-  try {
-    const have = await db.execute("SELECT 1 FROM portal_meta WHERE key = 'announcements' LIMIT 1");
-    if (have.rows.length === 0) {
-      const { rows: ann } = await db.execute(
-        `SELECT id, title, content, category, importance, created_at
-           FROM announcements ORDER BY created_at DESC LIMIT 20`,
-      );
-      if (ann.length > 0) {
-        await db.execute(
-          'INSERT INTO portal_meta (key, value) VALUES (?, ?)',
-          ['announcements', JSON.stringify(ann)],
-        );
-        logger.info('Migrated announcements → portal_meta', { count: ann.length });
-      }
-    }
-  } catch {
-    // announcements may not exist on a fresh DB — ignore.
-  }
-
-  // 3. Seed default portal_meta if nothing exists yet (fresh DB).
-  await seedPortalMetaDefaults(db);
-
-  // 4. Drop the now-redundant legacy tables (data already copied to portal_meta).
-  await dropLegacyPortalTables(db);
-}
-
-/**
- * Seed default schedule (grade 7) + announcements into portal_meta when the
- * store is empty. Idempotent — only inserts missing keys.
- */
-async function seedPortalMetaDefaults(db) {
-  try {
-    // Default announcements.
-    const haveAnn = await db.execute("SELECT 1 FROM portal_meta WHERE key = 'announcements' LIMIT 1");
-    if (haveAnn.rows.length === 0) {
-      const announcements = [
-        { id: 1, title: 'بدء امتحانات نهاية الترم', content: 'تبدأ امتحانات نهاية الترم الدراسي الأول يوم الأحد القادم. يرجى من الطلاب الاستعداد والمراجعة الجيدة. نتمنى لكم التوفيق والنجاح.', category: 'exams', importance: 'high', created_at: new Date().toISOString() },
-        { id: 2, title: 'اجتماع أولياء الأمور', content: 'يُعقد اجتماع أولياء الأمور يوم الخميس القادم الساعة العاشرة صباحًا بقاعة المدرسة لمناقشة مستوى الطلاب.', category: 'meetings', importance: 'high', created_at: new Date().toISOString() },
-        { id: 3, title: 'رحلة مدرسية إلى المتحف المصري', content: 'تنظم المدرسة رحلة تعليمية إلى المتحف المصري الكبير يوم السبت القادم. رسوم الرحلة 50 جنيهًا. التسجيل بالأمانة.', category: 'trips', importance: 'normal', created_at: new Date().toISOString() },
-        { id: 4, title: 'مكافأة التفوق', content: 'سيتم تكريم الطلاب المتفوقين الذين حصلوا على التقدير العام في احتفال يوم الأحد. تهانينا للمتفوقين!', category: 'awards', importance: 'normal', created_at: new Date().toISOString() },
-      ];
-      await db.execute(
-        'INSERT INTO portal_meta (key, value) VALUES (?, ?)',
-        ['announcements', JSON.stringify(announcements)],
-      );
-      logger.info('Seeded default announcements into portal_meta', { count: announcements.length });
-    }
-
-    // Default schedule for grade 7 (one JSON row for the whole week).
-    const haveSched = await db.execute("SELECT 1 FROM portal_meta WHERE key = 'schedule:7' LIMIT 1");
-    if (haveSched.rows.length === 0) {
-      const days = ['الأحد', 'الإثنين', 'الثلاثاء', 'الأربعاء', 'الخميس'];
-      const base = [
-        { period: 1, start: '08:00', end: '08:45', subject: 'اللغة العربية', teacher: 'أ. فاطمة السيد' },
-        { period: 2, start: '08:45', end: '09:30', subject: 'الرياضيات', teacher: 'أ. خالد عبد الله' },
-        { period: 3, start: '09:30', end: '10:15', subject: 'اللغة الإنجليزية', teacher: 'أ. منى رضا' },
-        { period: 4, start: '10:35', end: '11:20', subject: 'العلوم', teacher: 'أ. أحمد سمير' },
-        { period: 5, start: '11:20', end: '12:05', subject: 'الدراسات الاجتماعية', teacher: 'أ. سعاد حسن' },
-        { period: 6, start: '12:05', end: '12:50', subject: 'التربية الدينية', teacher: 'أ. عبد الرحمن نور' },
-        { period: 7, start: '01:05', end: '01:50', subject: 'الحاسب الآلي', teacher: 'أ. هبة كمال' },
-      ];
-      const grouped = {};
-      for (let d = 0; d < days.length; d++) {
-        const rotated = [...base.slice(d % 3), ...base.slice(0, d % 3)];
-        grouped[days[d]] = rotated;
-      }
-      await db.execute(
-        'INSERT INTO portal_meta (key, value) VALUES (?, ?)',
-        ['schedule:7', JSON.stringify(grouped)],
-      );
-      logger.info('Seeded default schedule:7 into portal_meta');
-    }
-  } catch (error) {
-    logger.warn('Seed portal_meta defaults skipped', { message: error.message });
-  }
-}
-
-/**
- * Drop the legacy announcements + class_schedule tables. Safe because their
- * data has already been copied into portal_meta. A table is dropped if it is
- * empty OR portal_meta holds the corresponding migrated data.
- */
-async function dropLegacyPortalTables(db) {
-  for (const [table, metaKey] of [['announcements', 'announcements']]) {
-    await dropLegacyTableIfSafe(db, table, metaKey);
-  }
-  // class_schedule migrates to multiple 'schedule:GRADE' keys; drop if every
-  // grade present in the legacy table also exists in portal_meta (or it's empty).
-  await dropLegacyScheduleIfSafe(db);
-}
-
-/** Drop a single legacy table when empty or fully migrated to portal_meta. */
-async function dropLegacyTableIfSafe(db, table, metaKey) {
-  try {
-    const { rows } = await db.execute(`SELECT COUNT(*) AS c FROM ${table}`);
-    const count = Number(rows[0]?.c || 0);
-    if (count === 0) {
-      await db.execute(`DROP TABLE IF EXISTS ${table}`);
-      logger.info('Dropped empty legacy table', { table });
-      return;
-    }
-    const migrated = await db.execute('SELECT 1 FROM portal_meta WHERE key = ? LIMIT 1', [metaKey]);
-    if (migrated.rows.length > 0) {
-      await db.execute(`DROP TABLE IF EXISTS ${table}`);
-      logger.info('Dropped migrated legacy table', { table, rows: count });
-    }
-  } catch {
-    // Table doesn't exist — nothing to do.
-  }
-}
-
-/** Drop class_schedule only once every grade has a schedule:GRADE row in portal_meta. */
-async function dropLegacyScheduleIfSafe(db) {
-  try {
-    const { rows } = await db.execute('SELECT COUNT(*) AS c FROM class_schedule');
-    const count = Number(rows[0]?.c || 0);
-    if (count === 0) {
-      await db.execute('DROP TABLE IF EXISTS class_schedule');
-      logger.info('Dropped empty legacy table', { table: 'class_schedule' });
-      return;
-    }
-    const grades = await db.execute('SELECT DISTINCT grade_level FROM class_schedule');
-    let allMigrated = true;
-    for (const g of grades.rows) {
-      const have = await db.execute('SELECT 1 FROM portal_meta WHERE key = ? LIMIT 1', [`schedule:${Number(g.grade_level)}`]);
-      if (have.rows.length === 0) { allMigrated = false; break; }
-    }
-    if (allMigrated) {
-      await db.execute('DROP TABLE IF EXISTS class_schedule');
-      logger.info('Dropped fully-migrated legacy table', { table: 'class_schedule', rows: count });
-    }
-  } catch {
-    // class_schedule doesn't exist — nothing to do.
-  }
-}
-
-/**
- * Idempotent schema bootstrap for the SEPARATE teacher database (the
- * independent Turso account). Creates ONLY the teacher workflow tables so the
- * teacher DB stays isolated from the student DB. Runs on every boot.
- * @param {{ execute: (sql: string, args?: unknown[]) => Promise<unknown> }} db
- */
+/** Teacher-DB bootstrap. Idempotent. @param {RawDb} db */
 async function runTeacherMigrations(db) {
-  const statements = [
-    `CREATE TABLE IF NOT EXISTS teacher_accounts (
-       id            TEXT PRIMARY KEY,
-       name          TEXT NOT NULL,
-       email         TEXT NOT NULL UNIQUE,
-       password_hash TEXT NOT NULL,
-       phone         TEXT,
-       subject       TEXT,
-       is_verified   INTEGER NOT NULL DEFAULT 0,
-       created_at    TEXT NOT NULL DEFAULT (datetime('now')),
-       updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
-     )`,
-    `CREATE INDEX IF NOT EXISTS idx_teacher_accounts_email
-       ON teacher_accounts (email)`,
-    `CREATE INDEX IF NOT EXISTS idx_teacher_accounts_pending
-       ON teacher_accounts (is_verified, created_at)`,
-    `CREATE TABLE IF NOT EXISTS teacher_student_relations (
-       teacher_id  TEXT NOT NULL,
-       student_id  TEXT NOT NULL,
-       created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-       PRIMARY KEY (teacher_id, student_id)
-     )`,
-    `CREATE INDEX IF NOT EXISTS idx_tsr_student
-       ON teacher_student_relations (student_id)`,
-    `CREATE INDEX IF NOT EXISTS idx_tsr_teacher
-       ON teacher_student_relations (teacher_id)`,
-    `DROP TRIGGER IF EXISTS teacher_accounts_updated_at`,
-    `CREATE TRIGGER teacher_accounts_updated_at AFTER UPDATE ON teacher_accounts
-       FOR EACH ROW WHEN NEW.updated_at = OLD.updated_at
-       BEGIN UPDATE teacher_accounts SET updated_at = datetime('now') WHERE id = NEW.id; END`,
-  ];
-
-  for (const sql of statements) {
-    await db.execute(sql);
+  try {
+    for (const sql of TEACHER_DDL) await exec(db, sql);
+    logger.info('Teacher database schema ready', {});
+  } catch (error) {
+    logger.error('Teacher migration error', { message: error.message });
   }
-  logger.info('Teacher database schema ready (Turso/libSQL)', { statements: statements.length });
-
-  // Refresh query-planner statistics for optimal reads.
-  try { await db.execute('ANALYZE'); } catch { /* non-fatal on some backends */ }
 }
 
-module.exports = { runMigrations, runTeacherMigrations };
-
+module.exports = { runMigrations, runTeacherMigrations, SCHEMA_VERSION };

@@ -4,6 +4,7 @@ const { config, getDbUrl } = require('../config/env');
 const { withConnection } = require('../db/client');
 const { redisGet, redisSetEx, redisDel } = require('../db/redis');
 const { invalidate } = require('../db/diskCache');
+const { ensureSchool } = require('./school.service');
 const AppError = require('../lib/AppError');
 const { resolveGovCode, resolveGovName } = require('../utils/governorates');
 const { isDistrictManagerRole, normalizeRole } = require('../utils/roles');
@@ -11,7 +12,8 @@ const { requireFields, assert14DigitSsn, assertGradeLevel, normalizeGender } = r
 
 /**
  * Student "login" = profile lookup by 14-digit token + grade level.
- * Implements cache-aside: Redis first, libSQL second.
+ * Implements cache-aside: Redis first, libSQL second. The students row is now
+ * lean (no JSON blobs) so this is a single cheap index/PK read.
  */
 async function loginStudent(payload = {}) {
   requireFields(payload, ['ssn_encrypted', 'grade_level'], 'ssn_encrypted and grade_level are required');
@@ -31,11 +33,7 @@ async function loginStudent(payload = {}) {
   const cacheKey = `student:${gradeLevel}:${ssn}`;
   const cached = await redisGet(cacheKey);
   if (cached) {
-    try {
-      return JSON.parse(cached);
-    } catch {
-      /* ignore corrupt cache, fall through to DB */
-    }
+    try { return JSON.parse(cached); } catch { /* ignore corrupt cache */ }
   }
 
   try {
@@ -77,8 +75,8 @@ async function loginStudent(payload = {}) {
 }
 
 /**
- * Create or update a student. Principals are locked to their own school.
- * Invalidates the cache entry on write.
+ * Create or update a student PROFILE (no academic data here). Principals are
+ * locked to their own school. Invalidates caches on write.
  */
 async function saveStudent(payload = {}, user = {}) {
   requireFields(payload, ['ssn_encrypted', 'grade_level'], 'ssn_encrypted and grade_level are required');
@@ -100,13 +98,15 @@ async function saveStudent(payload = {}, user = {}) {
   const className = payload.class_name ? String(payload.class_name).trim() : null;
   const ssn = String(payload.ssn_encrypted);
 
-  const schoolName = role === 'principal' ? user.school_name : payload.school_name || null;
+  const schoolName = role === 'principal' ? user.school_name : (payload.school_name || null);
   const adminZone =
     role === 'principal'
-      ? user.admin_zone || payload.admin_zone || null
+      ? (user.admin_zone || payload.admin_zone || null)
       : isDistrictManagerRole(role) && user.admin_zone && user.admin_zone !== 'ALL'
         ? user.admin_zone
-        : payload.admin_zone || null;
+        : (payload.admin_zone || null);
+
+  await ensureSchool({ gov_code: govCode, admin_zone: adminZone, school_name: schoolName });
 
   try {
     const result = await withConnection(async (db) => {
@@ -122,22 +122,12 @@ async function saveStudent(payload = {}, user = {}) {
             school_name     = excluded.school_name,
             grade_level     = excluded.grade_level,
             class_name      = excluded.class_name`,
-        [
-          ssn,
-          payload.student_name_ar ? String(payload.student_name_ar) : null,
-          gender,
-          govCode,
-          adminZone,
-          schoolName,
-          gradeLevel,
-          className,
-        ],
+        [ssn, payload.student_name_ar ? String(payload.student_name_ar) : null, gender, govCode, adminZone, schoolName, gradeLevel, className],
       );
       return { affectedRows: rs.rowsAffected };
     });
 
     await redisDel(`student:${gradeLevel}:${ssn}`);
-    // Write-through: invalidate the disk-cached portal so it rebuilds from DB.
     await invalidate(`portal:${ssn}:${gradeLevel}`);
 
     return { message: 'Student saved successfully', affectedRows: result.affectedRows };

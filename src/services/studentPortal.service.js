@@ -5,19 +5,20 @@ const { getCacheAsync, setCache } = require('../db/diskCache');
 const AppError = require('../lib/AppError');
 const { assert14DigitSsn, assertGradeLevel } = require('../utils/validation');
 
-// Never-expire: cached portal data served from disk on every read until a write
-// invalidates it. If HF disk is wiped, cache rebuilds from Turso on first read.
+// Portal data is cached to disk and served until a write invalidates it.
+// If the disk is wiped, it rebuilds from Turso on first read.
 const CACHE_TTL_SEC = 0;
 
 /**
- * Fetch the FULL student portal from a SINGLE database row.
+ * Fetch the FULL student portal in ONE database round trip.
  *
- * All per-student data (grades, attendance, weekly assessments) is stored as
- * JSON columns ON the students row, so this reads exactly ONE row from Turso
- * (plus the shared schedule + announcements). That's the minimum possible
- * read cost — no table scans, no joins, no per-subject rows.
+ * Six index-only / PK lookups are sent as a single libSQL batch (one HTTP
+ * call): profile, grades, attendance, weekly, and the two shared portal_meta
+ * rows (schedule + announcements). With the disk cache, repeat reads cost
+ * ZERO Turso reads.
  *
- * With the disk cache, repeat reads cost ZERO Turso reads.
+ * Grades now carry teacher_id + updated_at (impossible in the old JSON model).
+ * @param {{ ssn_encrypted?: string, grade_level?: number|string }} query
  */
 async function getStudentPortal(query = {}) {
   if (!query.ssn_encrypted) throw new AppError(400, 'ssn_encrypted is required.');
@@ -30,124 +31,116 @@ async function getStudentPortal(query = {}) {
   const cached = await getCacheAsync(cacheKey);
   if (cached) return cached;
 
-  // ── SINGLE row read: profile + all JSON columns in one query ──
-  let profileRes;
-  try {
-    profileRes = await getClient().execute({
+  /** @type {{ sql: string; args: unknown[] }[]} */
+  const batchStmts = [
+    {
       sql: `SELECT ssn_encrypted, student_name_ar, gender, gov_code, admin_zone,
-                   school_name, grade_level, class_name,
-                   grades_json, attendance_json, weekly_json
+                   school_name, grade_level, class_name
               FROM students WHERE ssn_encrypted = ? LIMIT 1`,
       args: [ssn],
-    });
-  } catch (error) {
-    throw new AppError(500, 'Failed to fetch student profile', error.message);
-  }
-  if (profileRes.rows.length === 0) {
-    throw new AppError(404, 'Student not found.');
-  }
-  const row = profileRes.rows[0];
-
-  // Parse all JSON columns from the single row.
-  const gradesObj = parseJson(row.grades_json, {});
-  const attendanceArr = parseJson(row.attendance_json, []);
-  const weeklyObj = parseJson(row.weekly_json, {});
-
-  // Build grades array.
-  const grades = Object.entries(gradesObj)
-    .filter(([, v]) => v !== null && v !== undefined && v !== '')
-    .map(([subject_name, grade_value]) => ({
-      subject_name,
-      grade_value: String(grade_value),
-    }))
-    .sort((a, b) => a.subject_name.localeCompare(b.subject_name, 'ar'));
-
-  // Compute average.
-  const gradeValues = grades.map((g) => parseFloat(g.grade_value)).filter((v) => !isNaN(v));
-  const average =
-    gradeValues.length > 0
-      ? (gradeValues.reduce((a, b) => a + b, 0) / gradeValues.length).toFixed(1)
-      : null;
-
-  // Compute attendance stats.
-  const attendanceStats = computeAttendanceStats(attendanceArr);
-  const absenceLimit = {
-    used: attendanceArr.filter((a) => String(a.status).toLowerCase() === 'absent').length,
-    limit: 30,
-    remaining: Math.max(0, 30 - attendanceArr.filter((a) => String(a.status).toLowerCase() === 'absent').length),
-  };
-
-  // ── Shared data: ONE query returns BOTH rows from the lean portal_meta store
-  // (schedule:GRADE + announcements). This replaces ~38 per-day/per-announcement
-  // rows with exactly 2 rows — the core read-cost reduction.
-  const metaRows = await safeQuery(
-    () => getClient().execute({
+    },
+    {
+      sql: `SELECT subject_name, grade_value, updated_by AS teacher_id, updated_at
+              FROM student_grades WHERE ssn_encrypted = ? ORDER BY subject_name ASC`,
+      args: [ssn],
+    },
+    {
+      sql: `SELECT date, status, note
+              FROM attendance WHERE ssn_encrypted = ? ORDER BY date DESC`,
+      args: [ssn],
+    },
+    {
+      sql: `SELECT subject_name, week_number AS week, score, max_score
+              FROM weekly_assessments WHERE ssn_encrypted = ?
+              ORDER BY subject_name ASC, week_number ASC`,
+      args: [ssn],
+    },
+    {
       sql: `SELECT key, value FROM portal_meta WHERE key IN (?, ?)`,
       args: [`schedule:${gradeLevel}`, 'announcements'],
-    }),
-    [],
-  );
+    },
+  ];
+
+  const results = await getClient().batch(batchStmts, 'read');
+
+  const profile = results[0].rows[0];
+  if (!profile) throw new AppError(404, 'Student not found.');
+
+  // Grades (already typed rows; values are stored as TEXT).
+  const grades = results[1].rows.map((r) => ({
+    subject_name: r.subject_name,
+    grade_value: String(r.grade_value),
+    teacher_id: r.teacher_id == null ? null : Number(r.teacher_id),
+    updated_at: r.updated_at == null ? null : String(r.updated_at),
+  }));
+
+  const gradeValues = grades.map((g) => parseFloat(g.grade_value)).filter((v) => !isNaN(v));
+  const average =
+    gradeValues.length > 0 ? (gradeValues.reduce((a, b) => a + b, 0) / gradeValues.length).toFixed(1) : null;
+
+  // Attendance.
+  const attendance = results[2].rows.map((r) => ({
+    date: String(r.date),
+    status: String(r.status),
+    note: r.note == null ? null : String(r.note),
+  }));
+  const attendanceStats = computeAttendanceStats(attendance);
+  const absentCount = attendance.filter((a) => a.status === 'absent').length;
+  const absenceLimit = { used: absentCount, limit: 30, remaining: Math.max(0, 30 - absentCount) };
+
+  // Weekly assessments grouped by subject.
+  /** @type {Record<string, Array<{ week: number, score: number, max_score: number }>>} */
+  const weeklyAssessments = {};
+  for (const r of results[3].rows) {
+    const subj = String(r.subject_name);
+    if (!weeklyAssessments[subj]) weeklyAssessments[subj] = [];
+    weeklyAssessments[subj].push({ week: Number(r.week), score: Number(r.score), max_score: Number(r.max_score) });
+  }
+
+  // Shared schedule + announcements.
   /** @type {Record<string, any>} */
   const meta = {};
-  for (const r of metaRows) meta[r.key] = r.value;
+  for (const r of results[4].rows) meta[String(r.key)] = r.value;
   const schedule = parseJson(meta[`schedule:${gradeLevel}`], {});
   const announcements = parseJson(meta['announcements'], []);
 
-  // Build the result.
   const result = {
     student: {
-      ssn_encrypted: row.ssn_encrypted,
-      student_name_ar: row.student_name_ar,
-      gender: row.gender,
-      gov_code: row.gov_code,
-      admin_zone: row.admin_zone,
-      school_name: row.school_name,
-      grade_level: row.grade_level,
-      class_name: row.class_name,
+      ssn_encrypted: profile.ssn_encrypted,
+      student_name_ar: profile.student_name_ar,
+      gender: profile.gender,
+      gov_code: profile.gov_code,
+      admin_zone: profile.admin_zone,
+      school_name: profile.school_name,
+      grade_level: profile.grade_level,
+      class_name: profile.class_name,
     },
     grades,
     average,
-    weeklyAssessments: weeklyObj,
-    attendance: attendanceArr,
+    weeklyAssessments,
+    attendance,
     attendanceStats,
     absenceLimit,
-    schedule, // already grouped by day from portal_meta JSON
-    announcements, // already shaped from portal_meta JSON
+    schedule,
+    announcements,
   };
 
-  // Write-through to disk cache.
   await setCache(cacheKey, result, CACHE_TTL_SEC);
-
   return result;
 }
 
-/** Safe JSON parse with fallback. */
 function parseJson(raw, fallback) {
-  try {
-    return typeof raw === 'string' && raw ? JSON.parse(raw) : fallback;
-  } catch {
-    return fallback;
-  }
-}
-
-/** Run a query; return [] on any error so a failure never breaks the page. */
-async function safeQuery(fn, fallback) {
-  try {
-    const res = await fn();
-    return res.rows || fallback;
-  } catch {
-    return fallback;
-  }
+  try { return typeof raw === 'string' && raw ? JSON.parse(raw) : fallback; }
+  catch { return fallback; }
 }
 
 function computeAttendanceStats(attendance) {
   const stats = { present: 0, absent: 0, late: 0, excused: 0, total: attendance.length };
   for (const a of attendance) {
-    const s = String(a.status).toLowerCase();
-    if (s === 'present') stats.present++;
-    else if (s === 'absent') stats.absent++;
-    else if (s === 'late') stats.late++;
-    else if (s === 'excused') stats.excused++;
+    if (a.status === 'present') stats.present++;
+    else if (a.status === 'absent') stats.absent++;
+    else if (a.status === 'late') stats.late++;
+    else if (a.status === 'excused') stats.excused++;
   }
   stats.percentage = stats.total > 0 ? Math.round((stats.present / stats.total) * 100) : 100;
   return stats;

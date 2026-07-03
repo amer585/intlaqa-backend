@@ -8,7 +8,7 @@ const requireTeacherAccount = require('../middleware/requireTeacherAccount');
 const requireStaffRole = require('../middleware/requireStaffRole');
 const { authRateLimiter } = require('../middleware/security');
 const { loginStaff } = require('../services/auth.service');
-const { registerStaff, addTeacher } = require('../services/staff.service');
+const { registerStaff, addTeacher, assignTeacherClass, listTeacherClasses } = require('../services/staff.service');
 const {
   registerTeacher,
   loginTeacher,
@@ -21,6 +21,7 @@ const {
 } = require('../services/teacherAccount.service');
 const { loginStudent, saveStudent } = require('../services/student.service');
 const { updateGrade } = require('../services/grade.service');
+const { updateAttendance } = require('../services/attendance.service');
 const { logActions } = require('../services/activity.service');
 const { getStudentPortal } = require('../services/studentPortal.service');
 const {
@@ -66,6 +67,19 @@ function createApiRouter() {
   // ---- Protected writes ----
   router.post('/grades/update', authenticateToken, asyncHandler(async (req, res) => {
     res.status(200).json(await updateGrade(req.body, req.user));
+  }));
+
+  router.post('/attendance/update', authenticateToken, asyncHandler(async (req, res) => {
+    res.status(200).json(await updateAttendance(req.body));
+  }));
+
+  // Assign / list teacher→(class,subject) authorization (grade-edit scope).
+  router.post('/admin/teacher-classes', authenticateToken, asyncHandler(async (req, res) => {
+    res.status(201).json(await assignTeacherClass(req.body, req.user));
+  }));
+
+  router.get('/staff/teacher-classes', authenticateToken, asyncHandler(async (req, res) => {
+    res.status(200).json(await listTeacherClasses(req.user, req.query));
   }));
 
   router.post('/admin/add-teacher', authenticateToken, asyncHandler(async (req, res) => {

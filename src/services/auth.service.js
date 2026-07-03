@@ -10,8 +10,10 @@ const logger = require('../lib/logger');
 const { isBcryptHash } = require('../utils/validation');
 
 /**
- * Authenticate a staff member and issue a JWT. bcrypt-only — non-bcrypt hashes
- * are rejected at login with a generic 401 (no plaintext fallback).
+ * Authenticate a staff member and issue a JWT. Reads from the `staff` table
+ * (renamed from the legacy `teachers` table). JWT carries `teacher_id`
+ * (= staff_id) so the existing frontend token shape is unchanged.
+ * bcrypt-only — non-bcrypt hashes are rejected with a generic 401.
  * @param {{ username?: string, password?: string }} payload
  */
 async function loginStaff(payload = {}) {
@@ -23,8 +25,9 @@ async function loginStaff(payload = {}) {
   try {
     return await withConnection(async (db) => {
       const { rows } = await db.execute(
-        `SELECT teacher_id, teacher_name_ar, role, gov_code, admin_zone, school_name, password_hash
-           FROM teachers
+        `SELECT staff_id AS teacher_id, display_name AS teacher_name_ar,
+                role, gov_code, admin_zone, school_name, password_hash
+           FROM staff
           WHERE username = ? AND is_active = 1
           LIMIT 1`,
         [String(username)],

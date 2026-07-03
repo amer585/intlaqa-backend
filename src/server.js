@@ -2,7 +2,7 @@
 
 const { createApp } = require('./app');
 const { config } = require('./config/env');
-const { getClient, getTeacherClient, closeClient, wrap } = require('./db/client');
+const { getClient, getTeacherClient, closeClient } = require('./db/client');
 const { runMigrations, runTeacherMigrations } = require('./db/migrate');
 const { initDiskCache, cleanupExpired } = require('./db/diskCache');
 const logger = require('./lib/logger');
@@ -72,8 +72,8 @@ function startServer() {
 // Background migration — never blocks startup, never crashes the process.
 async function runMigrationsAsync() {
   try {
-    const db = wrap(getClient());
-    await runMigrations(db);
+    // Pass the RAW client (exposes .batch) — migrate.js uses {sql,args} + batch.
+    await runMigrations(getClient());
   } catch (error) {
     logger.error('Schema migration failed', { message: error.message });
   }
@@ -82,8 +82,7 @@ async function runMigrationsAsync() {
 // Teacher DB bootstrap — runs against the independent teacher Turso account.
 async function runTeacherMigrationsAsync() {
   try {
-    const db = wrap(getTeacherClient());
-    await runTeacherMigrations(db);
+    await runTeacherMigrations(getTeacherClient());
   } catch (error) {
     logger.error('Teacher schema migration failed', { message: error.message });
   }

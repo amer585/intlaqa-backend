@@ -1,17 +1,27 @@
 'use strict';
 
 const { getDbUrl } = require('../config/env');
-const { withConnection, withTransaction, inPlaceholders } = require('../db/client');
+const { getClient, inPlaceholders } = require('../db/client');
 const { invalidate } = require('../db/diskCache');
 const AppError = require('../lib/AppError');
 const { requireFields, assert14DigitSsn, assertGradeLevel } = require('../utils/validation');
 
 /**
- * Update one or many grades for a single class+subject — atomically, with bulk
- * queries. Steps inside one transaction:
- *   1. verify teacher is assigned to (grade,class,subject)
- *   2. bulk-check all target students exist
- *   3. multi-row upsert
+ * Record one or many subject grades for a single class+subject — atomically,
+ * with NO lost updates.
+ *
+ *   OLD (v3): read each student's whole grades_json blob → mutate → write it
+ *   back. Two teachers editing different subjects for the same student
+ *   clobbered each other (last write wins = lost data) and held a row lock.
+ *
+ *   NEW (v4): one subject grade = one row. We upsert exactly (ssn, subject)
+ *   rows in a single libSQL batch (one round trip, one transaction). Concurrent
+ *   teachers on different subjects touch different rows → no contention, no
+ *   lost data. We also now persist who/when (updated_by, updated_at).
+ *
+ * Flow (2 round trips):
+ *   1. batch-read: teacher authorization + bulk student existence check.
+ *   2. batch-write: one upsert per target student.
  *
  * @param {Record<string, unknown> | Array<Record<string, unknown>>} payload
  * @param {{ teacher_id?: number }} user
@@ -20,6 +30,7 @@ async function updateGrade(payload, user) {
   if (!user.teacher_id) {
     throw new AppError(403, 'Forbidden: teacher_id is missing from the token.');
   }
+  const teacherId = Number(user.teacher_id);
 
   const grades = Array.isArray(payload) ? payload : [payload];
   if (grades.length === 0) return { message: 'No grades to update.' };
@@ -31,8 +42,7 @@ async function updateGrade(payload, user) {
   const className = String(first.class_name).trim();
   const subjectName = String(first.subject_name).trim();
 
-  const dbUrl = getDbUrl(gradeLevel);
-  if (!dbUrl) throw new AppError(400, `Invalid grade_level: ${first.grade_level}`);
+  if (!getDbUrl(gradeLevel)) throw new AppError(400, `Invalid grade_level: ${first.grade_level}`);
 
   // Normalise + validate every row up front.
   const clean = [];
@@ -43,59 +53,52 @@ async function updateGrade(payload, user) {
   }
   if (clean.length === 0) return { message: 'No valid grades to update.' };
 
+  const ssns = clean.map((g) => g.ssn_encrypted);
+  const client = getClient();
+
   try {
-    // 1. Verify teacher assignment (single query).
-    const assigned = await withConnection(async (db) => {
-      const { rows } = await db.execute(
-        `SELECT 1 FROM teacher_classes
-          WHERE teacher_id = ? AND grade_level = ? AND class_name = ? AND subject_name = ?
-          LIMIT 1`,
-        [user.teacher_id, gradeLevel, className, subjectName],
-      );
-      return rows.length > 0;
-    });
-    if (!assigned) {
+    // 1) Authorization + existence in ONE round trip (batch read).
+    const [authRes, existRes] = await client.batch(
+      [
+        {
+          sql: `SELECT 1 FROM teacher_classes
+                  WHERE teacher_id = ? AND grade_level = ? AND class_name = ? AND subject_name = ?
+                  LIMIT 1`,
+          args: [teacherId, gradeLevel, className, subjectName],
+        },
+        {
+          sql: `SELECT ssn_encrypted FROM students
+                  WHERE grade_level = ? AND class_name = ? AND ssn_encrypted IN (${inPlaceholders(ssns.length)})`,
+          args: [gradeLevel, className, ...ssns],
+        },
+      ],
+      'read',
+    );
+
+    if (authRes.rows.length === 0) {
       throw new AppError(403, 'Forbidden: Teacher cannot edit grades for this subject/class.');
     }
 
-    // 2 + 3. Validate students exist, then update the single grades_json column
-    // for each student (read-modify-write inside one transaction).
-    await withTransaction(async (db) => {
-      const ssns = clean.map((g) => g.ssn_encrypted);
+    const found = new Set(existRes.rows.map((r) => String(r.ssn_encrypted)));
+    const missing = ssns.filter((s) => !found.has(s));
+    if (missing.length > 0) {
+      throw new AppError(404, `Students not found in grade ${gradeLevel} / class ${className}: ${missing.join(', ')}`);
+    }
 
-      const inClause = inPlaceholders(ssns.length);
-      const { rows: found } = await db.execute(
-        `SELECT ssn_encrypted, grades_json FROM students
-          WHERE grade_level = ? AND class_name = ? AND ssn_encrypted IN (${inClause})`,
-        [gradeLevel, className, ...ssns],
-      );
-      const foundMap = new Map(found.map((r) => [r.ssn_encrypted, r.grades_json]));
-      const missing = ssns.filter((s) => !foundMap.has(s));
-      if (missing.length > 0) {
-        throw new AppError(404, `Students not found in grade ${gradeLevel} / class ${className}: ${missing.join(', ')}`);
-      }
+    // 2) One atomic batch upsert (1 round trip). Each row is independent →
+    //    no contention / no clobbering between subjects or teachers.
+    const stmts = clean.map((g) => ({
+      sql: `INSERT INTO student_grades (ssn_encrypted, subject_name, grade_value, updated_by, updated_at)
+            VALUES (?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(ssn_encrypted, subject_name) DO UPDATE SET
+              grade_value = excluded.grade_value,
+              updated_by   = excluded.updated_by,
+              updated_at   = datetime('now')`,
+      args: [g.ssn_encrypted, subjectName, g.grade_value, teacherId],
+    }));
+    await client.batch(stmts, 'write');
 
-      // For each target student: merge the new subject grade into grades_json.
-      const toUpdate = clean.filter((g) => foundMap.has(g.ssn_encrypted));
-      for (const g of toUpdate) {
-        let existing = {};
-        try {
-          existing = foundMap.get(g.ssn_encrypted)
-            ? JSON.parse(foundMap.get(g.ssn_encrypted))
-            : {};
-        } catch {
-          existing = {};
-        }
-        existing[subjectName] = g.grade_value;
-        await db.execute(
-          `UPDATE students SET grades_json = ?, updated_at = datetime('now') WHERE ssn_encrypted = ?`,
-          [JSON.stringify(existing), g.ssn_encrypted],
-        );
-      }
-    });
-
-    // ── Write-through: invalidate each affected student's cached portal so
-    // the next read rebuilds it fresh from Turso (cache stays consistent). ──
+    // Invalidate each affected student's cached portal so the next read rebuilds.
     for (const g of clean) {
       await invalidate(`portal:${g.ssn_encrypted}:${gradeLevel}`);
     }
