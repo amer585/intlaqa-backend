@@ -77,17 +77,21 @@ async function getStudentPortal(query = {}) {
     remaining: Math.max(0, 30 - attendanceArr.filter((a) => String(a.status).toLowerCase() === 'absent').length),
   };
 
-  // ── Shared data: schedule + announcements (small, cached by the disk cache) ──
-  const [schedule, announcements] = await Promise.all([
-    safeQuery(() => getClient().execute({
-      sql: `SELECT day, period, start_time, end_time, subject_name, teacher_name FROM class_schedule WHERE grade_level = ? ORDER BY day ASC, period ASC`,
-      args: [gradeLevel],
-    }), []),
-    safeQuery(() => getClient().execute({
-      sql: `SELECT id, title, content, category, importance, created_at FROM announcements ORDER BY created_at DESC LIMIT 20`,
-      args: [],
-    }), []),
-  ]);
+  // ── Shared data: ONE query returns BOTH rows from the lean portal_meta store
+  // (schedule:GRADE + announcements). This replaces ~38 per-day/per-announcement
+  // rows with exactly 2 rows — the core read-cost reduction.
+  const metaRows = await safeQuery(
+    () => getClient().execute({
+      sql: `SELECT key, value FROM portal_meta WHERE key IN (?, ?)`,
+      args: [`schedule:${gradeLevel}`, 'announcements'],
+    }),
+    [],
+  );
+  /** @type {Record<string, any>} */
+  const meta = {};
+  for (const r of metaRows) meta[r.key] = r.value;
+  const schedule = parseJson(meta[`schedule:${gradeLevel}`], {});
+  const announcements = parseJson(meta['announcements'], []);
 
   // Build the result.
   const result = {
@@ -107,15 +111,8 @@ async function getStudentPortal(query = {}) {
     attendance: attendanceArr,
     attendanceStats,
     absenceLimit,
-    schedule: groupSchedule(schedule),
-    announcements: announcements.map((a) => ({
-      id: a.id,
-      title: a.title,
-      content: a.content,
-      category: a.category,
-      importance: a.importance,
-      created_at: a.created_at,
-    })),
+    schedule, // already grouped by day from portal_meta JSON
+    announcements, // already shaped from portal_meta JSON
   };
 
   // Write-through to disk cache.
@@ -154,21 +151,6 @@ function computeAttendanceStats(attendance) {
   }
   stats.percentage = stats.total > 0 ? Math.round((stats.present / stats.total) * 100) : 100;
   return stats;
-}
-
-function groupSchedule(rows) {
-  const byDay = {};
-  for (const row of rows) {
-    if (!byDay[row.day]) byDay[row.day] = [];
-    byDay[row.day].push({
-      period: row.period,
-      start_time: row.start_time,
-      end_time: row.end_time,
-      subject_name: row.subject_name,
-      teacher_name: row.teacher_name,
-    });
-  }
-  return byDay;
 }
 
 module.exports = { getStudentPortal };

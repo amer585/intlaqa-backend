@@ -92,40 +92,18 @@ async function runMigrations(db) {
     `CREATE INDEX IF NOT EXISTS idx_wa_ssn
        ON weekly_assessments (ssn_encrypted, week_number)`,
 
-    // ── School portal tables ─────────────────────────────────
-    `CREATE TABLE IF NOT EXISTS announcements (
-       id          INTEGER PRIMARY KEY AUTOINCREMENT,
-       title       TEXT NOT NULL,
-       content     TEXT NOT NULL,
-       category    TEXT DEFAULT 'general',
-       importance  TEXT DEFAULT 'normal',
-       target_grade INTEGER,
-       school_name TEXT,
-       created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    // ── Portal meta (replaces the old announcements + class_schedule tables)
+    // Key/value blob store. The ENTIRE weekly schedule for a grade is ONE row
+    // (key 'schedule:7') and all announcements are ONE row (key 'announcements').
+    // This collapses the portal read from ~38 rows (per-day/per-period schedule
+    // + per-announcement rows) down to exactly TWO rows.
+    `CREATE TABLE IF NOT EXISTS portal_meta (
+       key        TEXT PRIMARY KEY,
+       value      TEXT NOT NULL,
+       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
      )`,
-    `CREATE TABLE IF NOT EXISTS student_attendance (
-       id            INTEGER PRIMARY KEY AUTOINCREMENT,
-       ssn_encrypted TEXT NOT NULL,
-       grade_level   INTEGER NOT NULL,
-       date          TEXT NOT NULL,
-       status        TEXT NOT NULL,
-       note          TEXT,
-       UNIQUE(ssn_encrypted, date)
-     )`,
-    `CREATE INDEX IF NOT EXISTS idx_att_ssn
-       ON student_attendance (ssn_encrypted, date DESC)`,
-    `CREATE TABLE IF NOT EXISTS class_schedule (
-       id           INTEGER PRIMARY KEY AUTOINCREMENT,
-       grade_level  INTEGER NOT NULL,
-       class_name   TEXT NOT NULL,
-       day          TEXT NOT NULL,
-       period       INTEGER NOT NULL,
-       start_time   TEXT NOT NULL,
-       end_time     TEXT NOT NULL,
-       subject_name TEXT NOT NULL,
-       teacher_name TEXT,
-       UNIQUE(grade_level, class_name, day, period)
-     )`,
+    // Legacy tables kept declared here ONLY so a fresh boot can migrate any
+    // data out of them; they are dropped after migration (see dropLegacyPortalTables).
 
     // updated_at triggers (SQLite pattern: DROP then CREATE).
     `DROP TRIGGER IF EXISTS teachers_updated_at`,
@@ -170,8 +148,9 @@ async function runMigrations(db) {
   // Drop legacy tables that are now fully replaced by JSON columns.
   await dropLegacyTables(db);
 
-  // Seed default portal data (announcements, schedule) if tables are empty.
-  await seedDefaults(db);
+  // Migrate legacy schedule/announcements tables into portal_meta, then drop
+  // them. Seeds defaults if nothing exists yet.
+  await restructurePortalMeta(db);
   await seedStudentJsonDefaults(db);
 }
 
@@ -374,35 +353,106 @@ async function migrateGradesToJson(db) {
 }
 
 /**
- * Seed announcements + a weekly schedule if they don't exist yet. Idempotent —
- * only inserts when the tables are empty, so it's safe on every boot.
+ * Restructure the portal's shared data (schedule + announcements) from bulky
+ * per-row tables into a single lean portal_meta(key,value) blob store.
+ *
+ *   - class_schedule (one row per day/period) → portal_meta['schedule:GRADE']
+ *     = ONE JSON row holding the whole week, grouped by day.
+ *   - announcements (one row each)            → portal_meta['announcements']
+ *     = ONE JSON row holding the array.
+ *
+ * Idempotent: guarded by existence checks, so re-running is a no-op. After
+ * migrating, the legacy tables are dropped. Seeds defaults if nothing exists.
  */
-async function seedDefaults(db) {
+async function restructurePortalMeta(db) {
+  // 1. Migrate any existing class_schedule rows into portal_meta (grouped JSON).
   try {
-    // ── Announcements ──
-    const { rows: annCount } = await db.execute('SELECT COUNT(*) as c FROM announcements');
-    if (Number(annCount[0]?.c) === 0) {
-      const announcements = [
-        { title: 'بدء امتحانات نهاية الترم', content: 'تبدأ امتحانات نهاية الترم الدراسي الأول يوم الأحد القادم. يرجى من الطلاب الاستعداد والمراجعة الجيدة. نتمنى لكم التوفيق والنجاح.', category: 'exams', importance: 'high' },
-        { title: 'اجتماع أولياء الأمور', content: 'يُعقد اجتماع أولياء الأمور يوم الخميس القادم الساعة العاشرة صباحًا بقاعة المدرسة لمناقشة مستوى الطلاب.', category: 'meetings', importance: 'high' },
-        { title: 'رحلة مدرسية إلى المتحف المصري', content: 'تنظم المدرسة رحلة تعليمية إلى المتحف المصري الكبير يوم السبت القادم. رسوم الرحلة 50 جنيهًا. التسجيل بالأمانة.', category: 'trips', importance: 'normal' },
-        { title: 'مكافأة التفوق', content: 'سيتم تكريم الطلاب المتفوقين الذين حصلوا على التقدير العام في احتفال يوم الأحد. تهانينا للمتفوقين!', category: 'awards', importance: 'normal' },
-        { title: 'تغيير مواعيد الحصص', content: 'ابتداءً من الأسبوع القادم سيتم تعديل مواعيد بعض الحصص الدراسية. يرجى الاطلاع على الجدول الجديد.', category: 'schedule', importance: 'normal' },
-      ];
-      for (const a of announcements) {
-        await db.execute(
-          'INSERT INTO announcements (title, content, category, importance) VALUES (?, ?, ?, ?)',
-          [a.title, a.content, a.category, a.importance],
-        );
+    const { rows: grades } = await db.execute('SELECT DISTINCT grade_level FROM class_schedule');
+    for (const g of grades) {
+      const gradeLevel = Number(g.grade_level);
+      const key = `schedule:${gradeLevel}`;
+      const have = await db.execute('SELECT 1 FROM portal_meta WHERE key = ? LIMIT 1', [key]);
+      if (have.rows.length > 0) continue; // already migrated
+      const { rows: sched } = await db.execute(
+        `SELECT day, period, start_time, end_time, subject_name, teacher_name
+           FROM class_schedule WHERE grade_level = ? ORDER BY day, period`,
+        [gradeLevel],
+      );
+      const grouped = {};
+      for (const r of sched) {
+        if (!grouped[r.day]) grouped[r.day] = [];
+        grouped[r.day].push({
+          period: Number(r.period),
+          start_time: r.start_time,
+          end_time: r.end_time,
+          subject_name: r.subject_name,
+          teacher_name: r.teacher_name,
+        });
       }
-      logger.info('Seeded announcements', { count: announcements.length });
+      await db.execute(
+        'INSERT INTO portal_meta (key, value) VALUES (?, ?)',
+        [key, JSON.stringify(grouped)],
+      );
+      logger.info('Migrated schedule → portal_meta', { grade: gradeLevel, rows: sched.length });
+    }
+  } catch {
+    // class_schedule may not exist on a fresh DB — ignore.
+  }
+
+  // 2. Migrate any existing announcements into a single portal_meta row.
+  try {
+    const have = await db.execute("SELECT 1 FROM portal_meta WHERE key = 'announcements' LIMIT 1");
+    if (have.rows.length === 0) {
+      const { rows: ann } = await db.execute(
+        `SELECT id, title, content, category, importance, created_at
+           FROM announcements ORDER BY created_at DESC LIMIT 20`,
+      );
+      if (ann.length > 0) {
+        await db.execute(
+          'INSERT INTO portal_meta (key, value) VALUES (?, ?)',
+          ['announcements', JSON.stringify(ann)],
+        );
+        logger.info('Migrated announcements → portal_meta', { count: ann.length });
+      }
+    }
+  } catch {
+    // announcements may not exist on a fresh DB — ignore.
+  }
+
+  // 3. Seed default portal_meta if nothing exists yet (fresh DB).
+  await seedPortalMetaDefaults(db);
+
+  // 4. Drop the now-redundant legacy tables (data already copied to portal_meta).
+  await dropLegacyPortalTables(db);
+}
+
+/**
+ * Seed default schedule (grade 7) + announcements into portal_meta when the
+ * store is empty. Idempotent — only inserts missing keys.
+ */
+async function seedPortalMetaDefaults(db) {
+  try {
+    // Default announcements.
+    const haveAnn = await db.execute("SELECT 1 FROM portal_meta WHERE key = 'announcements' LIMIT 1");
+    if (haveAnn.rows.length === 0) {
+      const announcements = [
+        { id: 1, title: 'بدء امتحانات نهاية الترم', content: 'تبدأ امتحانات نهاية الترم الدراسي الأول يوم الأحد القادم. يرجى من الطلاب الاستعداد والمراجعة الجيدة. نتمنى لكم التوفيق والنجاح.', category: 'exams', importance: 'high', created_at: new Date().toISOString() },
+        { id: 2, title: 'اجتماع أولياء الأمور', content: 'يُعقد اجتماع أولياء الأمور يوم الخميس القادم الساعة العاشرة صباحًا بقاعة المدرسة لمناقشة مستوى الطلاب.', category: 'meetings', importance: 'high', created_at: new Date().toISOString() },
+        { id: 3, title: 'رحلة مدرسية إلى المتحف المصري', content: 'تنظم المدرسة رحلة تعليمية إلى المتحف المصري الكبير يوم السبت القادم. رسوم الرحلة 50 جنيهًا. التسجيل بالأمانة.', category: 'trips', importance: 'normal', created_at: new Date().toISOString() },
+        { id: 4, title: 'مكافأة التفوق', content: 'سيتم تكريم الطلاب المتفوقين الذين حصلوا على التقدير العام في احتفال يوم الأحد. تهانينا للمتفوقين!', category: 'awards', importance: 'normal', created_at: new Date().toISOString() },
+      ];
+      await db.execute(
+        'INSERT INTO portal_meta (key, value) VALUES (?, ?)',
+        ['announcements', JSON.stringify(announcements)],
+      );
+      logger.info('Seeded default announcements into portal_meta', { count: announcements.length });
     }
 
-    // ── Class schedule for grade 7 ──
-    const { rows: schedCount } = await db.execute('SELECT COUNT(*) as c FROM class_schedule WHERE grade_level = 7');
-    if (Number(schedCount[0]?.c) === 0) {
+    // Default schedule for grade 7 (one JSON row for the whole week).
+    const haveSched = await db.execute("SELECT 1 FROM portal_meta WHERE key = 'schedule:7' LIMIT 1");
+    if (haveSched.rows.length === 0) {
       const days = ['الأحد', 'الإثنين', 'الثلاثاء', 'الأربعاء', 'الخميس'];
-      const baseSchedule = [
+      const base = [
         { period: 1, start: '08:00', end: '08:45', subject: 'اللغة العربية', teacher: 'أ. فاطمة السيد' },
         { period: 2, start: '08:45', end: '09:30', subject: 'الرياضيات', teacher: 'أ. خالد عبد الله' },
         { period: 3, start: '09:30', end: '10:15', subject: 'اللغة الإنجليزية', teacher: 'أ. منى رضا' },
@@ -411,20 +461,78 @@ async function seedDefaults(db) {
         { period: 6, start: '12:05', end: '12:50', subject: 'التربية الدينية', teacher: 'أ. عبد الرحمن نور' },
         { period: 7, start: '01:05', end: '01:50', subject: 'الحاسب الآلي', teacher: 'أ. هبة كمال' },
       ];
-      // Vary the order slightly per day for realism.
+      const grouped = {};
       for (let d = 0; d < days.length; d++) {
-        const rotated = [...baseSchedule.slice(d % 3), ...baseSchedule.slice(0, d % 3)];
-        for (const s of rotated) {
-          await db.execute(
-            'INSERT INTO class_schedule (grade_level, class_name, day, period, start_time, end_time, subject_name, teacher_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-            [7, 'فصل 1/أ', days[d], s.period, s.start, s.end, s.subject, s.teacher],
-          );
-        }
+        const rotated = [...base.slice(d % 3), ...base.slice(0, d % 3)];
+        grouped[days[d]] = rotated;
       }
-      logger.info('Seeded class schedule', { days: days.length });
+      await db.execute(
+        'INSERT INTO portal_meta (key, value) VALUES (?, ?)',
+        ['schedule:7', JSON.stringify(grouped)],
+      );
+      logger.info('Seeded default schedule:7 into portal_meta');
     }
   } catch (error) {
-    logger.warn('Seed defaults skipped', { message: error.message });
+    logger.warn('Seed portal_meta defaults skipped', { message: error.message });
+  }
+}
+
+/**
+ * Drop the legacy announcements + class_schedule tables. Safe because their
+ * data has already been copied into portal_meta. A table is dropped if it is
+ * empty OR portal_meta holds the corresponding migrated data.
+ */
+async function dropLegacyPortalTables(db) {
+  for (const [table, metaKey] of [['announcements', 'announcements']]) {
+    await dropLegacyTableIfSafe(db, table, metaKey);
+  }
+  // class_schedule migrates to multiple 'schedule:GRADE' keys; drop if every
+  // grade present in the legacy table also exists in portal_meta (or it's empty).
+  await dropLegacyScheduleIfSafe(db);
+}
+
+/** Drop a single legacy table when empty or fully migrated to portal_meta. */
+async function dropLegacyTableIfSafe(db, table, metaKey) {
+  try {
+    const { rows } = await db.execute(`SELECT COUNT(*) AS c FROM ${table}`);
+    const count = Number(rows[0]?.c || 0);
+    if (count === 0) {
+      await db.execute(`DROP TABLE IF EXISTS ${table}`);
+      logger.info('Dropped empty legacy table', { table });
+      return;
+    }
+    const migrated = await db.execute('SELECT 1 FROM portal_meta WHERE key = ? LIMIT 1', [metaKey]);
+    if (migrated.rows.length > 0) {
+      await db.execute(`DROP TABLE IF EXISTS ${table}`);
+      logger.info('Dropped migrated legacy table', { table, rows: count });
+    }
+  } catch {
+    // Table doesn't exist — nothing to do.
+  }
+}
+
+/** Drop class_schedule only once every grade has a schedule:GRADE row in portal_meta. */
+async function dropLegacyScheduleIfSafe(db) {
+  try {
+    const { rows } = await db.execute('SELECT COUNT(*) AS c FROM class_schedule');
+    const count = Number(rows[0]?.c || 0);
+    if (count === 0) {
+      await db.execute('DROP TABLE IF EXISTS class_schedule');
+      logger.info('Dropped empty legacy table', { table: 'class_schedule' });
+      return;
+    }
+    const grades = await db.execute('SELECT DISTINCT grade_level FROM class_schedule');
+    let allMigrated = true;
+    for (const g of grades.rows) {
+      const have = await db.execute('SELECT 1 FROM portal_meta WHERE key = ? LIMIT 1', [`schedule:${Number(g.grade_level)}`]);
+      if (have.rows.length === 0) { allMigrated = false; break; }
+    }
+    if (allMigrated) {
+      await db.execute('DROP TABLE IF EXISTS class_schedule');
+      logger.info('Dropped fully-migrated legacy table', { table: 'class_schedule', rows: count });
+    }
+  } catch {
+    // class_schedule doesn't exist — nothing to do.
   }
 }
 
