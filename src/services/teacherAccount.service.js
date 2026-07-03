@@ -287,13 +287,14 @@ async function listTeacherStudents(user = {}) {
   ensureTeacherDb();
 
   try {
-    // 1. Relations live in the TEACHER DB.
+    // 1. Relations live in the TEACHER DB. LIMIT caps payload size.
     const relations = await withTeacherConnection(async (db) => {
       const { rows } = await db.execute(
         `SELECT student_id, created_at AS linked_at
            FROM teacher_student_relations
           WHERE teacher_id = ?
-          ORDER BY created_at DESC`,
+          ORDER BY created_at DESC
+          LIMIT 1000`,
         [teacherId],
       );
       return rows;
@@ -366,7 +367,8 @@ async function listPendingTeachers(user = {}) {
         `SELECT id, name, email, phone, subject, is_verified, created_at, updated_at
            FROM teacher_accounts
           WHERE is_verified = 0
-          ORDER BY created_at ASC`,
+          ORDER BY created_at ASC
+          LIMIT 500`,
       );
       return { pending: rows.map(sanitize) };
     });

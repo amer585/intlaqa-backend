@@ -147,6 +147,9 @@ async function runMigrations(db) {
   }
   logger.info('Database schema ready (Turso/libSQL)', { statements: statements.length });
 
+  // Refresh the query-planner statistics so reads pick the optimal index.
+  try { await db.execute('ANALYZE'); } catch { /* non-fatal on some backends */ }
+
   // Ensure existing students table has the JSON columns (ALTER is a no-op if
   // the column already exists; we guard with try/catch since SQLite lacks
   // ADD COLUMN IF NOT EXISTS).
@@ -468,6 +471,9 @@ async function runTeacherMigrations(db) {
     await db.execute(sql);
   }
   logger.info('Teacher database schema ready (Turso/libSQL)', { statements: statements.length });
+
+  // Refresh query-planner statistics for optimal reads.
+  try { await db.execute('ANALYZE'); } catch { /* non-fatal on some backends */ }
 }
 
 module.exports = { runMigrations, runTeacherMigrations };

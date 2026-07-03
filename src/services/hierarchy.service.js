@@ -131,32 +131,19 @@ async function getStudentsForHierarchy(query = {}, user = {}) {
     throw new AppError(403, 'Forbidden: You can only fetch students from your assigned school.');
   }
 
+  // SINGLE-table read (uses the covering idx_class_lookup index). Grades live
+  // in students.grades_json, so there's NO join — one small row-set, no scan.
   try {
     return await withConnection(async (db) => {
-      if (subjectName) {
-        const { rows } = await db.execute(
-          `SELECT s.ssn_encrypted, s.student_name_ar, s.gender,
-                  g.subject_name, g.grade_value, g.teacher_id, g.updated_at AS grade_updated_at
-             FROM students s
-             LEFT JOIN student_grades g
-               ON g.ssn_encrypted = s.ssn_encrypted
-              AND g.grade_level = s.grade_level
-              AND g.class_name = s.class_name
-              AND g.subject_name = ?
-            WHERE s.school_name = ? AND s.grade_level = ? AND s.class_name = ?`,
-          [subjectName, schoolName, gradeLevel, className],
-        );
-        return { students: mapRosterWithGrades(rows) };
-      }
-
       const { rows } = await db.execute(
-        `SELECT ssn_encrypted, student_name_ar, gender
+        `SELECT ssn_encrypted, student_name_ar, gender, grades_json
            FROM students
           WHERE school_name = ? AND grade_level = ? AND class_name = ?
-          ORDER BY student_name_ar ASC`,
+          ORDER BY student_name_ar ASC
+          LIMIT 500`,
         [schoolName, gradeLevel, className],
       );
-      return { students: rows };
+      return { students: mapRosterWithGrades(rows, subjectName) };
     });
   } catch (error) {
     if (error instanceof AppError) throw error;
@@ -164,28 +151,40 @@ async function getStudentsForHierarchy(query = {}, user = {}) {
   }
 }
 
-/** Collapse a flattened student+grade join into one object per student. */
-function mapRosterWithGrades(rows) {
-  const byStudent = new Map();
-  for (const row of rows) {
-    if (!byStudent.has(row.ssn_encrypted)) {
-      byStudent.set(row.ssn_encrypted, {
-        ssn_encrypted: row.ssn_encrypted,
-        student_name_ar: row.student_name_ar,
-        gender: row.gender,
-        grades: [],
-      });
-    }
-    if (row.subject_name) {
-      byStudent.get(row.ssn_encrypted).grades.push({
-        subject_name: row.subject_name,
-        grade_value: row.grade_value,
-        teacher_id: row.teacher_id,
-        updated_at: row.grade_updated_at,
-      });
-    }
+/**
+ * Collapse rows into one object per student. Reads grades from the
+ * grades_json column (single-table) instead of an expensive JOIN against the
+ * legacy student_grades table (which no longer exists after migration).
+ * When subjectName is set, only that subject's grade is surfaced — otherwise
+ * all subjects are returned.
+ */
+function mapRosterWithGrades(rows, subjectName = null) {
+  return rows.map((row) => {
+    const all = parseGradesJson(row.grades_json);
+    const grades = subjectName
+      ? (all[subjectName] !== undefined && all[subjectName] !== null && all[subjectName] !== ''
+          ? [{ subject_name: subjectName, grade_value: String(all[subjectName]) }]
+          : [])
+      : Object.entries(all)
+          .filter(([, v]) => v !== null && v !== undefined && v !== '')
+          .map(([subject_name, grade_value]) => ({ subject_name, grade_value: String(grade_value) }));
+    return {
+      ssn_encrypted: row.ssn_encrypted,
+      student_name_ar: row.student_name_ar,
+      gender: row.gender,
+      grades,
+    };
+  });
+}
+
+/** Parse the grades_json column into a plain object. */
+function parseGradesJson(raw) {
+  try {
+    const parsed = typeof raw === 'string' && raw ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
   }
-  return Array.from(byStudent.values());
 }
 
 module.exports = {
