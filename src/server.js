@@ -2,8 +2,8 @@
 
 const { createApp } = require('./app');
 const { config } = require('./config/env');
-const { getClient, closeClient, wrap } = require('./db/client');
-const { runMigrations } = require('./db/migrate');
+const { getClient, getTeacherClient, closeClient, wrap } = require('./db/client');
+const { runMigrations, runTeacherMigrations } = require('./db/migrate');
 const { initDiskCache, cleanupExpired } = require('./db/diskCache');
 const logger = require('./lib/logger');
 
@@ -21,7 +21,12 @@ function startServer() {
     logger.warn('JWT_SECRET not set — generated a random ephemeral secret. Set JWT_SECRET for persistent sessions.');
   }
   if (!config.dbAvailable) {
-    logger.warn('DATABASE_URL not set — database features will be unavailable. Trial login still works if ALLOW_TEST_LOGIN=true.');
+    logger.warn('DATABASE_URL not set — student database features will be unavailable. Trial login still works if ALLOW_TEST_LOGIN=true.');
+  }
+  if (!config.teacherDbAvailable) {
+    logger.warn('TEACHER_DATABASE_URL not set — teacher workflow features will be unavailable.');
+  } else {
+    logger.info('Teacher database configured — teacher workflow enabled.');
   }
 
   // Start listening IMMEDIATELY — never block the port on DB readiness.
@@ -39,6 +44,10 @@ function startServer() {
   // slow/failing DB never prevents the server from responding.
   if (config.dbAvailable) {
     runMigrationsAsync();
+  }
+  // Teacher DB is independent (separate Turso account) — bootstrap it too.
+  if (config.teacherDbAvailable) {
+    runTeacherMigrationsAsync();
   }
 
   let shuttingDown = false;
@@ -67,6 +76,16 @@ async function runMigrationsAsync() {
     await runMigrations(db);
   } catch (error) {
     logger.error('Schema migration failed', { message: error.message });
+  }
+}
+
+// Teacher DB bootstrap — runs against the independent teacher Turso account.
+async function runTeacherMigrationsAsync() {
+  try {
+    const db = wrap(getTeacherClient());
+    await runTeacherMigrations(db);
+  } catch (error) {
+    logger.error('Teacher schema migration failed', { message: error.message });
   }
 }
 

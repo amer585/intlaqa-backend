@@ -5,30 +5,51 @@ const { createClient } = require('@libsql/client');
 const { config } = require('../config/env');
 const logger = require('../lib/logger');
 
-let client = null;
-
 /**
- * Lazily create the single libSQL client. libSQL manages its own connection
- * pool internally (HTTP-based for remote Turso), so we don't need a pg-style
- * Pool — one client is correct and optimal.
+ * Registry of raw libSQL clients keyed by their URL. libSQL manages its own
+ * connection pool internally (HTTP-based for remote Turso), so one client per
+ * database URL is correct and optimal. Separate URLs → separate clients →
+ * separate capacity/limits.
+ * @type {Map<string, import('@libsql/client').Client>}
  */
-function getClient() {
-  if (!config.dbAvailable) {
-    throw new Error('DATABASE_URL is not configured — database features unavailable.');
-  }
-  if (!client) {
-    client = createClient({
-      url: config.databaseUrl,
-      authToken: config.tursoAuthToken || undefined,
-    });
-    logger.info('Turso (libSQL) client created', { url: maskUrl(config.databaseUrl) });
-  }
-  return client;
-}
+const clients = new Map();
 
 /** Hide the password/token in logs. */
 function maskUrl(url) {
   return url ? url.replace(/:[^:@]+@/, ':***@') : 'none';
+}
+
+/** Lazily create (and cache) a libSQL client for a given URL/token pair. */
+function getOrCreateRawClient(url, token) {
+  if (!clients.has(url)) {
+    clients.set(
+      url,
+      createClient({ url, authToken: token || undefined }),
+    );
+    logger.info('Turso (libSQL) client created', { url: maskUrl(url) });
+  }
+  return clients.get(url);
+}
+
+/**
+ * Default client → STUDENT database (backward compatible).
+ */
+function getClient() {
+  if (!config.dbAvailable) {
+    throw new Error('DATABASE_URL is not configured — student database features unavailable.');
+  }
+  return getOrCreateRawClient(config.databaseUrl, config.tursoAuthToken);
+}
+
+/**
+ * Teacher database client. Throws a clear error if the teacher DB isn't
+ * configured — callers convert this into an AppError(503).
+ */
+function getTeacherClient() {
+  if (!config.teacherDbAvailable) {
+    throw new Error('TEACHER_DATABASE_URL is not configured — teacher database features unavailable.');
+  }
+  return getOrCreateRawClient(config.teacherDatabaseUrl, config.teacherDatabaseToken);
 }
 
 /**
@@ -49,7 +70,7 @@ function wrap(target) {
 }
 
 /**
- * Run `callback` against the libSQL client.
+ * Run `callback` against the STUDENT (default) libSQL client.
  * @template T
  * @param {(db: ReturnType<typeof wrap>) => Promise<T>} callback
  * @returns {Promise<T>}
@@ -59,8 +80,18 @@ async function withConnection(callback) {
 }
 
 /**
- * Run `callback` inside a single transaction. Commits on success, rolls back on
- * error.
+ * Run `callback` against the TEACHER libSQL client.
+ * @template T
+ * @param {(db: ReturnType<typeof wrap>) => Promise<T>} callback
+ * @returns {Promise<T>}
+ */
+async function withTeacherConnection(callback) {
+  return callback(wrap(getTeacherClient()));
+}
+
+/**
+ * Run `callback` inside a single transaction on the STUDENT (default) DB.
+ * Commits on success, rolls back on error.
  * @template T
  * @param {(db: ReturnType<typeof wrap>) => Promise<T>} callback
  * @returns {Promise<T>}
@@ -78,13 +109,45 @@ async function withTransaction(callback) {
   }
 }
 
-/** One-shot liveness check used by GET /health. */
+/**
+ * Run `callback` inside a single transaction on the TEACHER DB.
+ * @template T
+ * @param {(db: ReturnType<typeof wrap>) => Promise<T>} callback
+ * @returns {Promise<T>}
+ */
+async function withTeacherTransaction(callback) {
+  const tx = await getTeacherClient().transaction('write');
+  const db = wrap(tx);
+  try {
+    const result = await callback(db);
+    await tx.commit();
+    return result;
+  } catch (error) {
+    await tx.rollback().catch(() => {});
+    throw error;
+  }
+}
+
+/** One-shot liveness check for the STUDENT DB, used by GET /health. */
 async function pingDatabase() {
   if (!config.dbAvailable) {
     return { ok: false, error: 'DATABASE_URL not configured' };
   }
   try {
-    await getClient().execute('SELECT 1 AS ok');
+    await getOrCreateRawClient(config.databaseUrl, config.tursoAuthToken).execute('SELECT 1 AS ok');
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+}
+
+/** One-shot liveness check for the TEACHER DB, used by GET /health. */
+async function pingTeacherDatabase() {
+  if (!config.teacherDbAvailable) {
+    return { ok: false, error: 'TEACHER_DATABASE_URL not configured' };
+  }
+  try {
+    await getOrCreateRawClient(config.teacherDatabaseUrl, config.teacherDatabaseToken).execute('SELECT 1 AS ok');
     return { ok: true };
   } catch (error) {
     return { ok: false, error: error.message };
@@ -92,10 +155,10 @@ async function pingDatabase() {
 }
 
 async function closeClient() {
-  if (client) {
-    client.close();
-    client = null;
+  for (const c of clients.values()) {
+    try { c.close(); } catch { /* ignore */ }
   }
+  clients.clear();
 }
 
 // ── Placeholder helpers (libSQL uses ? like SQLite) ───────────
@@ -113,10 +176,14 @@ function inPlaceholders(count) {
 
 module.exports = {
   getClient,
+  getTeacherClient,
   wrap,
   withConnection,
+  withTeacherConnection,
   withTransaction,
+  withTeacherTransaction,
   pingDatabase,
+  pingTeacherDatabase,
   closeClient,
   valuesPlaceholders,
   inPlaceholders,

@@ -62,10 +62,40 @@ function isBcryptHash(hash) {
   );
 }
 
+// ── Teacher account validation ──────────────────────────────
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const MIN_PASSWORD_LENGTH = 8;
+
+/** Lowercase + trim an email for consistent uniqueness. @param {unknown} raw */
+function normalizeEmail(raw) {
+  return String(raw || '').trim().toLowerCase();
+}
+
+/** Throw 400 when the value isn't a well-formed email. @param {unknown} raw */
+function assertValidEmail(raw) {
+  const email = normalizeEmail(raw);
+  if (!EMAIL_REGEX.test(email)) {
+    throw new AppError(400, 'A valid email address is required.');
+  }
+  return email;
+}
+
+/** Throw 400 when the password is too short. @param {unknown} raw */
+function assertStrongPassword(raw) {
+  const password = String(raw ?? '');
+  if (password.length < MIN_PASSWORD_LENGTH) {
+    throw new AppError(400, `Password must be at least ${MIN_PASSWORD_LENGTH} characters.`);
+  }
+  return password;
+}
+
 module.exports = {
   requireFields,
   assert14DigitSsn,
   assertGradeLevel,
   normalizeGender,
   isBcryptHash,
+  normalizeEmail,
+  assertValidEmail,
+  assertStrongPassword,
 };

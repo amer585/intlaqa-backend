@@ -6,7 +6,7 @@ const path = require('path');
 const fs = require('fs');
 
 const createApiRouter = require('./routes');
-const { pingDatabase } = require('./db/client');
+const { pingDatabase, pingTeacherDatabase } = require('./db/client');
 const { redisEnabled, redisPing } = require('./db/redis');
 const { errorHandler } = require('./middleware/errorHandler');
 const { securityHeaders, corsMiddleware, apiRateLimiter } = require('./middleware/security');
@@ -35,6 +35,7 @@ function createApp() {
       status: 'ok',
       service: 'Intlaqa / Madrastna API v3',
       db: config.dbAvailable ? 'configured' : 'NOT CONFIGURED',
+      teacher_db: config.teacherDbAvailable ? 'configured' : 'NOT CONFIGURED',
       cache: redisEnabled ? 'redis' : 'disabled',
       trial_login: config.allowTestLogin,
       jwt_secret: config.jwtSecretFallback ? 'fallback (ephemeral)' : 'configured',
@@ -48,15 +49,18 @@ function createApp() {
       db = await pingDatabase();
     }
     const cache = await redisPing();
+    const teacher = await pingTeacherDatabase();
     const cacheOk = !cache.enabled || cache.ok;
     const allOk = db.ok && cacheOk;
     res.status(200).json({
       status: allOk ? 'ok' : 'degraded',
       uptime: process.uptime(),
       database: db,
+      teacher_database: teacher,
       cache,
       warnings: {
         noDb: !config.dbAvailable,
+        noTeacherDb: !config.teacherDbAvailable,
         jwtFallback: config.jwtSecretFallback,
       },
     });

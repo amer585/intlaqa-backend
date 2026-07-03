@@ -20,11 +20,20 @@ function parseList(raw) {
   return Array.from(new Set(raw.split(',').map((s) => s.trim()).filter(Boolean)));
 }
 
-// ── Database (Turso / libSQL) ────────────────────────────────
+// ── Database (Turso / libSQL) — STUDENT DB ───────────────────
+// The primary/legacy database: students, grades, staff logins.
 // NEVER throw — if DATABASE_URL is missing, mark db unavailable and keep booting.
 const databaseUrl = process.env.DATABASE_URL || null;
 const tursoAuthToken = process.env.TURSO_AUTH_TOKEN || null;
 const dbAvailable = Boolean(databaseUrl);
+
+// ── Database (Turso / libSQL) — TEACHER DB (separate account) ─
+// Independent Turso account/DB to isolate teacher data and double the free
+// limits. Holds teacher_accounts + teacher_student_relations. Independent of
+// the student DB so the two apps have isolated capacity + secrets.
+const teacherDatabaseUrl = process.env.TEACHER_DATABASE_URL || null;
+const teacherDatabaseToken = process.env.TEACHER_DATABASE_TOKEN || null;
+const teacherDbAvailable = Boolean(teacherDatabaseUrl);
 
 // ── JWT ───────────────────────────────────────────────────────
 // NEVER throw — generate a random fallback if missing/weak so the server boots.
@@ -48,6 +57,9 @@ const config = Object.freeze({
   databaseUrl,
   tursoAuthToken,
   dbAvailable,
+  teacherDatabaseUrl,
+  teacherDatabaseToken,
+  teacherDbAvailable,
   schoolCacheTtlMs: 30 * 60 * 1000,
 
   upstashRedisUrl: process.env.UPSTASH_REDIS_REST_URL || null,

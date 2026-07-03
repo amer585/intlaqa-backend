@@ -4,9 +4,21 @@ const express = require('express');
 
 const asyncHandler = require('../lib/asyncHandler');
 const authenticateToken = require('../middleware/authenticateToken');
+const requireTeacherAccount = require('../middleware/requireTeacherAccount');
+const requireStaffRole = require('../middleware/requireStaffRole');
 const { authRateLimiter } = require('../middleware/security');
 const { loginStaff } = require('../services/auth.service');
 const { registerStaff, addTeacher } = require('../services/staff.service');
+const {
+  registerTeacher,
+  loginTeacher,
+  getTeacherProfile,
+  updateTeacherProfile,
+  linkStudent,
+  listTeacherStudents,
+  listPendingTeachers,
+  setTeacherVerification,
+} = require('../services/teacherAccount.service');
 const { loginStudent, saveStudent } = require('../services/student.service');
 const { updateGrade } = require('../services/grade.service');
 const { logActions } = require('../services/activity.service');
@@ -72,6 +84,50 @@ function createApiRouter() {
   router.get('/student/portal', asyncHandler(async (req, res) => {
     res.status(200).json(await getStudentPortal(req.query));
   }));
+
+  // ---- Teacher account workflow (email self-registration → admin approval → JWT) ----
+  router.post('/teacher/register', authRateLimiter, asyncHandler(async (req, res) => {
+    res.status(201).json(await registerTeacher(req.body));
+  }));
+
+  router.post('/teacher/login', authRateLimiter, asyncHandler(async (req, res) => {
+    res.status(200).json(await loginTeacher(req.body));
+  }));
+
+  router.get('/teacher/profile', authenticateToken, requireTeacherAccount, asyncHandler(async (req, res) => {
+    res.status(200).json(await getTeacherProfile(req.user));
+  }));
+
+  router.patch('/teacher/profile', authenticateToken, requireTeacherAccount, asyncHandler(async (req, res) => {
+    res.status(200).json(await updateTeacherProfile(req.body, req.user));
+  }));
+
+  router.get('/teacher/students', authenticateToken, requireTeacherAccount, asyncHandler(async (req, res) => {
+    res.status(200).json(await listTeacherStudents(req.user));
+  }));
+
+  router.post('/teacher/students', authenticateToken, requireTeacherAccount, asyncHandler(async (req, res) => {
+    res.status(201).json(await linkStudent(req.body, req.user));
+  }));
+
+  // ---- Admin approval of teacher accounts (staff-only) ----
+  router.get(
+    '/teacher/pending',
+    authenticateToken,
+    requireStaffRole('admin', 'principal', 'directorate', 'directorate_manager', 'district', 'district_manager'),
+    asyncHandler(async (req, res) => {
+      res.status(200).json(await listPendingTeachers(req.user));
+    }),
+  );
+
+  router.patch(
+    '/teacher/verify/:id',
+    authenticateToken,
+    requireStaffRole('admin', 'principal', 'directorate', 'directorate_manager', 'district', 'district_manager'),
+    asyncHandler(async (req, res) => {
+      res.status(200).json(await setTeacherVerification(req.params.id, req.user));
+    }),
+  );
 
   return router;
 }

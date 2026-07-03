@@ -75,6 +75,10 @@ async function runMigrations(db) {
     `CREATE INDEX IF NOT EXISTS idx_class_subject
        ON teacher_classes (grade_level, class_name, subject_name)`,
 
+    // NOTE: teacher_accounts + teacher_student_relations now live in the
+    // SEPARATE teacher database (see runTeacherMigrations below), NOT here.
+    // This keeps the two Turso accounts isolated.
+
     // ── Weekly assessments (التقديرات الأسبوعية) ─────────────
     `CREATE TABLE IF NOT EXISTS weekly_assessments (
        id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -421,5 +425,50 @@ async function seedDefaults(db) {
   }
 }
 
-module.exports = { runMigrations };
+/**
+ * Idempotent schema bootstrap for the SEPARATE teacher database (the
+ * independent Turso account). Creates ONLY the teacher workflow tables so the
+ * teacher DB stays isolated from the student DB. Runs on every boot.
+ * @param {{ execute: (sql: string, args?: unknown[]) => Promise<unknown> }} db
+ */
+async function runTeacherMigrations(db) {
+  const statements = [
+    `CREATE TABLE IF NOT EXISTS teacher_accounts (
+       id            TEXT PRIMARY KEY,
+       name          TEXT NOT NULL,
+       email         TEXT NOT NULL UNIQUE,
+       password_hash TEXT NOT NULL,
+       phone         TEXT,
+       subject       TEXT,
+       is_verified   INTEGER NOT NULL DEFAULT 0,
+       created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+       updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_teacher_accounts_email
+       ON teacher_accounts (email)`,
+    `CREATE INDEX IF NOT EXISTS idx_teacher_accounts_pending
+       ON teacher_accounts (is_verified, created_at)`,
+    `CREATE TABLE IF NOT EXISTS teacher_student_relations (
+       teacher_id  TEXT NOT NULL,
+       student_id  TEXT NOT NULL,
+       created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+       PRIMARY KEY (teacher_id, student_id)
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_tsr_student
+       ON teacher_student_relations (student_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_tsr_teacher
+       ON teacher_student_relations (teacher_id)`,
+    `DROP TRIGGER IF EXISTS teacher_accounts_updated_at`,
+    `CREATE TRIGGER teacher_accounts_updated_at AFTER UPDATE ON teacher_accounts
+       FOR EACH ROW WHEN NEW.updated_at = OLD.updated_at
+       BEGIN UPDATE teacher_accounts SET updated_at = datetime('now') WHERE id = NEW.id; END`,
+  ];
+
+  for (const sql of statements) {
+    await db.execute(sql);
+  }
+  logger.info('Teacher database schema ready (Turso/libSQL)', { statements: statements.length });
+}
+
+module.exports = { runMigrations, runTeacherMigrations };
 
