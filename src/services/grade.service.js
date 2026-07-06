@@ -2,9 +2,17 @@
 
 const { getDbUrl } = require('../config/env');
 const { getClient, inPlaceholders } = require('../db/client');
-const { invalidate } = require('../db/diskCache');
+const { invalidateBatch } = require('../db/diskCache');
+const { prefetchPortals } = require('../db/cachePrefetch');
 const AppError = require('../lib/AppError');
 const { requireFields, assert14DigitSsn, assertGradeLevel } = require('../utils/validation');
+
+// v5 — write-through budget. For a class-sized post this lets us prefetch each
+// affected portal in parallel so the user's next read hits warm cache. For a
+// pathological 200-student post we skip per-student prefetch (just the DELs)
+// to avoid ~200 synchronous Turso batches on the write path — the next reader
+// falls through to DB the normal way and warms the cache lazily.
+const PREFETCH_BUDGET = 50;
 
 /**
  * Record one or many subject grades for a single class+subject — atomically,
@@ -98,9 +106,16 @@ async function updateGrade(payload, user) {
     }));
     await client.batch(stmts, 'write');
 
-    // Invalidate each affected student's cached portal so the next read rebuilds.
-    for (const g of clean) {
-      await invalidate(`portal:${g.ssn_encrypted}:${gradeLevel}`);
+    // ── v5 write-through (pattern c: invalidate-then-prefetch) ──
+    // 1) Bust every affected portal key in 2 round-trips total (was N sequential
+    //    awaits: one Redis-DEL + one disk-DELETE per student).
+    const portalKeys = clean.map((g) => `portal:${g.ssn_encrypted}:${gradeLevel}`);
+    await invalidateBatch(portalKeys);
+
+    // 2) For class-sized posts only: repopulate the cache NOW so the user's next
+    //    read is hot. The existing portal reader does this — TTL=0 → Redis 365d.
+    if (portalKeys.length > 0 && portalKeys.length <= PREFETCH_BUDGET) {
+      await prefetchPortals(portalKeys);
     }
 
     return { message: 'Grades updated successfully.', updated: clean.length };

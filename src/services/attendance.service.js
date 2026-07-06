@@ -1,12 +1,15 @@
 'use strict';
 
 const { getClient } = require('../db/client');
-const { invalidate } = require('../db/diskCache');
+const { invalidateBatch, invalidatePrefix } = require('../db/diskCache');
+const { prefetchPortals } = require('../db/cachePrefetch');
 const AppError = require('../lib/AppError');
 const { assert14DigitSsn } = require('../utils/validation');
 
 const MAX_BATCH = 1000;
 const VALID_STATUS = new Set(['present', 'absent', 'late', 'excused']);
+const PREFETCH_BUDGET = 50;
+// v5 — write-through budget (mirrors grade.service).
 
 /**
  * Bulk record attendance for one class/day — one atomic libSQL batch (single
@@ -53,9 +56,21 @@ async function updateAttendance(payload) {
 
   try {
     await getClient().batch(stmts, 'write');
-    // Invalidate each affected student's cached portal.
+
+    const portalKeys = [];
+    const ssnOnlyKeys = [];
     for (const e of clean) {
-      if (e.grade_level) await invalidate(`portal:${e.ssn_encrypted}:${e.grade_level}`);
+      if (e.grade_level) portalKeys.push(`portal:${e.ssn_encrypted}:${e.grade_level}`);
+      else ssnOnlyKeys.push(e.ssn_encrypted);
+    }
+    if (portalKeys.length > 0) {
+      await invalidateBatch(portalKeys);
+      if (portalKeys.length <= PREFETCH_BUDGET) await prefetchPortals(portalKeys);
+    }
+    if (ssnOnlyKeys.length > 0) {
+      for (const ssn of Array.from(new Set(ssnOnlyKeys))) {
+        try { await invalidatePrefix(`portal:${ssn}:`); } catch { /* non-fatal */ }
+      }
     }
     return { message: 'Attendance updated successfully.', updated: clean.length };
   } catch (error) {

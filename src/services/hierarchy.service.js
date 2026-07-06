@@ -191,9 +191,27 @@ function mapRoster(studentRows, gradeRows, subjectName = null) {
   });
 }
 
+/**
+ * v5 NEW — Bust the in-process `schoolCache` 30-min TTL cache.
+ *
+ * v4 kept an in-memory cache of the tiny `schools` dimension table for 30 min.
+ * When `ensureSchool` INSERTed a new row (e.g. a principal enrolling the first
+ * student at a brand-new school), the new school didn't appear in
+ * `/api/hierarchy/schools` until the 30-min TTL elapsed or the process
+ * restarted. v5 invalidates the cache synchronously after the INSERT, so the
+ * next `loadSchools` re-reads from Turso.
+ *
+ * Also resets the inFlight dedupe so a concurrent caller re-issues a fresh
+ * HTTP call (not the cached in-flight promise that captured the old snapshot).
+ */
+function bustSchoolCache() {
+  schoolCache = { data: null, lastFetched: 0, inflight: null };
+}
+
 module.exports = {
   getSchoolsForUser,
   getDistrictsForUser,
   getClassesForHierarchy,
   getStudentsForHierarchy,
+  bustSchoolCache,
 };

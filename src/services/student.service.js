@@ -1,9 +1,11 @@
 'use strict';
 
 const { config, getDbUrl } = require('../config/env');
+const jwt = require('jsonwebtoken');
 const { withConnection } = require('../db/client');
 const { redisGet, redisSetEx, redisDel } = require('../db/redis');
-const { invalidate } = require('../db/diskCache');
+const { invalidate, invalidatePrefix } = require('../db/diskCache');
+const { prefetchPortals } = require('../db/cachePrefetch');
 const { ensureSchool } = require('./school.service');
 const AppError = require('../lib/AppError');
 const { resolveGovCode, resolveGovName } = require('../utils/governorates');
@@ -14,6 +16,12 @@ const { requireFields, assert14DigitSsn, assertGradeLevel, normalizeGender } = r
  * Student "login" = profile lookup by 14-digit token + grade level.
  * Implements cache-aside: Redis first, libSQL second. The students row is now
  * lean (no JSON blobs) so this is a single cheap index/PK read.
+ *
+ * v5 — also issues a student JWT so /student/portal can require auth (SSN
+ * moves OUT of the URL into the bearer token — anti-impersonation, no SSNs in
+ * proxy/HF access logs). The JWT carries the student's ssn/grade so the
+ * portal read ignores request-body fields and uses these — a logged-in
+ * student can ONLY read their own portal.
  */
 async function loginStudent(payload = {}) {
   requireFields(payload, ['ssn_encrypted', 'grade_level'], 'ssn_encrypted and grade_level are required');
@@ -29,7 +37,6 @@ async function loginStudent(payload = {}) {
     throw new AppError(400, `Invalid grade_level: ${payload.grade_level}`);
   }
 
-  // ── Cache-aside: try Redis first ──
   const cacheKey = `student:${gradeLevel}:${ssn}`;
   const cached = await redisGet(cacheKey);
   if (cached) {
@@ -51,19 +58,22 @@ async function loginStudent(payload = {}) {
       }
 
       const s = rows[0];
-      return {
-        message: 'Login successful',
-        student: {
-          ssn_encrypted: ssn,
-          grade_level: gradeLevel,
-          student_name_ar: s.student_name_ar,
-          school_name: s.school_name,
-          class_name: s.class_name,
-          admin_zone: s.admin_zone,
-          gov_code: resolveGovName(s.gov_code) || 'القاهرة',
-          gender: s.gender,
-        },
+      const student = {
+        ssn_encrypted: ssn,
+        grade_level: gradeLevel,
+        student_name_ar: s.student_name_ar,
+        school_name: s.school_name,
+        class_name: s.class_name,
+        admin_zone: s.admin_zone,
+        gov_code: resolveGovName(s.gov_code) || 'القاهرة',
+        gender: s.gender,
       };
+      const token = jwt.sign(
+        { type: 'student', ssn_encrypted: ssn, grade_level: gradeLevel },
+        config.jwtSecret,
+        { expiresIn: config.jwtExpiresIn },
+      );
+      return { message: 'Login successful', student, token };
     });
 
     await redisSetEx(cacheKey, config.redisTtlSec, JSON.stringify(result));
@@ -77,6 +87,13 @@ async function loginStudent(payload = {}) {
 /**
  * Create or update a student PROFILE (no academic data here). Principals are
  * locked to their own school. Invalidates caches on write.
+ *
+ * v5 — uses invalidatePrefix("portal:<ssn>:") so that when UPSERT changes a
+ * student's grade_level, BOTH the new portal:<ssn>:<newGrade> key AND the
+ * abandoned portal:<ssn>:<oldGrade> key are wiped. v4 only invalidated the
+ * new grade, leaving a stale never-expire portal snapshot in the cache for
+ * the old grade forever. Then prefetch the new portal so the user's next
+ * read is hot.
  */
 async function saveStudent(payload = {}, user = {}) {
   requireFields(payload, ['ssn_encrypted', 'grade_level'], 'ssn_encrypted and grade_level are required');
@@ -127,8 +144,12 @@ async function saveStudent(payload = {}, user = {}) {
       return { affectedRows: rs.rowsAffected };
     });
 
+    // v5 — login profile cache (Redis-only) + portal prefix sweep (catches
+    // a grade_level change that would otherwise leave a stale <ssn>:<oldGrade>
+    // portal snapshot) + prefetch the new portal so the next read is hot.
     await redisDel(`student:${gradeLevel}:${ssn}`);
-    await invalidate(`portal:${ssn}:${gradeLevel}`);
+    await invalidatePrefix(`portal:${ssn}:`);
+    await prefetchPortals([`portal:${ssn}:${gradeLevel}`]);
 
     return { message: 'Student saved successfully', affectedRows: result.affectedRows };
   } catch (error) {

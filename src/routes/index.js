@@ -3,6 +3,7 @@
 const express = require('express');
 
 const asyncHandler = require('../lib/asyncHandler');
+const AppError = require('../lib/AppError');
 const authenticateToken = require('../middleware/authenticateToken');
 const requireTeacherAccount = require('../middleware/requireTeacherAccount');
 const requireStaffRole = require('../middleware/requireStaffRole');
@@ -90,13 +91,34 @@ function createApiRouter() {
     res.status(200).json(await saveStudent(req.body, req.user));
   }));
 
-  router.post('/logAction', asyncHandler(async (req, res) => {
+  // v5 — gate /logAction (was unauth + anonymously writable). Tier-aware:
+  // students may only log actions for their own ssn (anti-ssn-enumeration);
+  // staff/teacher callers may log for any.
+  router.post('/logAction', authenticateToken, asyncHandler(async (req, res) => {
+    if (req.user.type === 'student' && req.user.ssn_encrypted) {
+      const entries = Array.isArray(req.body) ? req.body : [req.body];
+      for (const e of entries) {
+        if (e && e.ssn_encrypted && String(e.ssn_encrypted) !== String(req.user.ssn_encrypted)) {
+          throw new AppError(403, 'Forbidden: students can only log their own actions.');
+        }
+      }
+    }
     res.status(200).json(await logActions(req.body));
   }));
 
-  // ---- Student portal (full data: grades, attendance, schedule, announcements) ----
-  router.get('/student/portal', asyncHandler(async (req, res) => {
-    res.status(200).json(await getStudentPortal(req.query));
+  // v5 — Student portal (full data: grades, attendance, schedule, announcements).
+  // POST (was GET) + authRateLimiter + authenticateToken. SSN moves OUT of the
+  // URL into the JWT (no SSNs in proxy / HF access logs / browser history).
+  // Tier-aware: when the caller is a student JWT, IGNORE the body ssn/grade and
+  // use the JWT's — anti-impersonation (a logged-in student can ONLY read their
+  // own portal). Staff/teacher callers (e.g. teacher dashboard expanding a
+  // linked student's portal) MAY pass body ssn/grade to look up an arbitrary
+  // student.
+  router.post('/student/portal', authRateLimiter, authenticateToken, asyncHandler(async (req, res) => {
+    const query = req.user.type === 'student'
+      ? { ssn_encrypted: req.user.ssn_encrypted, grade_level: req.user.grade_level }
+      : (req.body || {});
+    res.status(200).json(await getStudentPortal(query));
   }));
 
   // ---- Teacher account workflow (email self-registration → admin approval → JWT) ----

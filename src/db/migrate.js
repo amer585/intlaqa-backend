@@ -1,20 +1,64 @@
 'use strict';
 
 const logger = require('../lib/logger');
+const { DIRECTORATES, EDUCATION_STAGES, SUBJECTS, SCHOOL_TERMS } = require('../utils/egyptEducation');
 
-// Bump when the schema/migration changes. The expensive one-time data
-// explosion only runs while this version marker is absent from portal_meta.
-const SCHEMA_VERSION = '4';
+// Bumped to '5' for the read-optimized rewrite: drops the redundant v4 indexes
+// (idx_attendance_ssn, idx_weekly_ssn, idx_schools_gov), adds the covering
+// idx_students_class_roster + idx_students_grade_class + idx_tsr_teacher_date,
+// tightens CHECK constraints on staff.is_active / weekly_assessments.score /
+// teacher_accounts.is_verified, and seeds four new additive reference tables
+// (directorates, education_stages, subjects, school_terms) modeling the Cairo
+// educational structure.
+//
+// The expensive one-time v3→v4 data explosion still only runs while this
+// version marker is absent from portal_meta. v4 databases booting v5 will
+// re-run the additive DDL (IF NOT EXISTS), drop the redundant indexes, and
+// first-run the new reference-data seeds.
+const SCHEMA_VERSION = '5';
 
 /** @typedef {{ execute: (q: { sql: string; args?: unknown[] }) => Promise<{ rows: Record<string, unknown>[]; rowsAffected: number; lastInsertRowid: number | bigint }>, batch: (stmts: { sql: string; args?: unknown[] }[], mode?: 'read'|'write'|'deferred') => Promise<any[]> }} RawDb */
 
 /** Thin helper so we always pass {sql,args}. @param {RawDb} db */
 const exec = (db, sql, args = []) => db.execute({ sql, args });
 
-// ── DDL (kept identical to schema.sql; duplicated so a fresh boot self-creates) ──
+// ── DDL (kept identical to schema.sql v5; duplicated so a fresh boot self-creates) ──
 const STUDENT_DDL = [
   `CREATE TABLE IF NOT EXISTS governorates (
      gov_code TEXT PRIMARY KEY, name_ar TEXT NOT NULL
+   )`,
+  // v5 NEW — Cairo educational directorates (الإدارات التعليمية).
+  `CREATE TABLE IF NOT EXISTS directorates (
+     directorate_code    TEXT    PRIMARY KEY,
+     gov_code            TEXT    NOT NULL,
+     directorate_name_ar TEXT    NOT NULL UNIQUE,
+     created_at          TEXT    NOT NULL DEFAULT (datetime('now'))
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_directorates_gov ON directorates (gov_code)`,
+  // v5 NEW — Egyptian K-12 education stages.
+  `CREATE TABLE IF NOT EXISTS education_stages (
+     stage_code    TEXT    PRIMARY KEY,
+     stage_name_ar TEXT    NOT NULL,
+     grade_from    INTEGER NOT NULL CHECK (grade_from BETWEEN 0 AND 12),
+     grade_to      INTEGER NOT NULL CHECK (grade_to   BETWEEN 0 AND 12),
+     ordinal       INTEGER NOT NULL CHECK (ordinal BETWEEN 0 AND 9)
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_stages_grade ON education_stages (grade_from, grade_to)`,
+  // v5 NEW — Subject catalog (per stage / secondary branch).
+  `CREATE TABLE IF NOT EXISTS subjects (
+     subject_code    TEXT    PRIMARY KEY,
+     subject_name_ar TEXT    NOT NULL,
+     stage_code      TEXT,
+     branch          TEXT    CHECK (branch IS NULL OR branch IN ('SCI_SCIENCES','SCI_MATH','LIT')),
+     ordinal         INTEGER NOT NULL DEFAULT 0
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_subjects_stage ON subjects (stage_code, ordinal)`,
+  `CREATE INDEX IF NOT EXISTS idx_subjects_name  ON subjects (subject_name_ar)`,
+  // v5 NEW — School terms (two-term Egyptian academic year).
+  `CREATE TABLE IF NOT EXISTS school_terms (
+     term_code    TEXT    PRIMARY KEY,
+     term_name_ar TEXT    NOT NULL,
+     ordinal      INTEGER NOT NULL CHECK (ordinal BETWEEN 1 AND 4)
    )`,
   `CREATE TABLE IF NOT EXISTS schools (
      school_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -23,7 +67,6 @@ const STUDENT_DDL = [
      UNIQUE (gov_code, admin_zone, school_name)
    )`,
   `CREATE INDEX IF NOT EXISTS idx_schools_zone ON schools (admin_zone, school_name)`,
-  `CREATE INDEX IF NOT EXISTS idx_schools_gov  ON schools (gov_code)`,
   `CREATE TABLE IF NOT EXISTS staff (
      staff_id INTEGER PRIMARY KEY AUTOINCREMENT,
      username TEXT NOT NULL UNIQUE,
@@ -33,7 +76,7 @@ const STUDENT_DDL = [
      gov_code TEXT,
      admin_zone TEXT NOT NULL DEFAULT 'ALL',
      school_name TEXT NOT NULL DEFAULT 'ALL',
-     is_active INTEGER NOT NULL DEFAULT 1,
+     is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1)),
      created_at TEXT NOT NULL DEFAULT (datetime('now')),
      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
    )`,
@@ -51,7 +94,14 @@ const STUDENT_DDL = [
    )`,
   `CREATE INDEX IF NOT EXISTS idx_students_class
      ON students (school_name, grade_level, class_name, admin_zone)`,
-  // student_grades / attendance / weekly are created AFTER legacy renames below.
+  // v5 NEW — covering + ordered for /api/hierarchy/students (no row-lookup, no sort).
+  `CREATE INDEX IF NOT EXISTS idx_students_class_roster
+     ON students (school_name, grade_level, class_name, student_name_ar,
+                  ssn_encrypted, gender)`,
+  // v5 NEW — for the /grades/update batch existence check.
+  `CREATE INDEX IF NOT EXISTS idx_students_grade_class
+     ON students (grade_level, class_name, ssn_encrypted)`,
+  // student_grades / attendance / weekly created AFTER legacy renames below.
   `CREATE TABLE IF NOT EXISTS teacher_classes (
      teacher_id INTEGER NOT NULL, grade_level INTEGER NOT NULL,
      class_name TEXT NOT NULL, subject_name TEXT NOT NULL,
@@ -69,6 +119,15 @@ const STUDENT_DDL = [
    )`,
 ];
 
+// v5 NEW — drop the redundant v4 indexes that duplicate a PK prefix or are
+// covered by a UNIQUE constraint prefix. No-op on a fresh DB; half the point
+// of v5 is that the old waste doesn't linger after upgrade.
+const LEGACY_INDEX_CLEANUP_DDL = [
+  `DROP INDEX IF EXISTS idx_attendance_ssn`, // dup of attendance PK prefix (ssn_encrypted, date)
+  `DROP INDEX IF EXISTS idx_weekly_ssn`,     // dup of weekly_assessments PK prefix (ssn_encrypted, ...)
+  `DROP INDEX IF EXISTS idx_schools_gov`,    // covered by UNIQUE(gov_code, admin_zone, school_name)
+];
+
 const NEW_GRADE_DDL = [
   `CREATE TABLE IF NOT EXISTS student_grades (
      ssn_encrypted TEXT NOT NULL, subject_name TEXT NOT NULL, grade_value TEXT NOT NULL,
@@ -84,15 +143,14 @@ const NEW_ATTENDANCE_DDL = [
      status TEXT NOT NULL CHECK (status IN ('present','absent','late','excused')),
      note TEXT, PRIMARY KEY (ssn_encrypted, date)
    )`,
-  `CREATE INDEX IF NOT EXISTS idx_attendance_ssn ON attendance (ssn_encrypted)`,
 ];
 const NEW_WEEKLY_DDL = [
   `CREATE TABLE IF NOT EXISTS weekly_assessments (
      ssn_encrypted TEXT NOT NULL, subject_name TEXT NOT NULL, week_number INTEGER NOT NULL,
-     score REAL NOT NULL, max_score REAL NOT NULL DEFAULT 10,
+     score REAL NOT NULL CHECK (score >= 0),
+     max_score REAL NOT NULL DEFAULT 10 CHECK (max_score > 0),
      PRIMARY KEY (ssn_encrypted, subject_name, week_number)
    )`,
-  `CREATE INDEX IF NOT EXISTS idx_weekly_ssn ON weekly_assessments (ssn_encrypted)`,
 ];
 
 const TRIGGER_DDL = [
@@ -110,7 +168,7 @@ const TEACHER_DDL = [
   `CREATE TABLE IF NOT EXISTS teacher_accounts (
      id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
      password_hash TEXT NOT NULL, phone TEXT, subject TEXT,
-     is_verified INTEGER NOT NULL DEFAULT 0,
+     is_verified INTEGER NOT NULL DEFAULT 0 CHECK (is_verified IN (0,1)),
      created_at TEXT NOT NULL DEFAULT (datetime('now')),
      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
    )`,
@@ -121,6 +179,10 @@ const TEACHER_DDL = [
      PRIMARY KEY (teacher_id, student_id)
    )`,
   `CREATE INDEX IF NOT EXISTS idx_tsr_student ON teacher_student_relations (student_id)`,
+  // v5 NEW — covering + ordered for /api/teacher/students (eliminates the
+  // created_at DESC sort on every dashboard load).
+  `CREATE INDEX IF NOT EXISTS idx_tsr_teacher_date
+     ON teacher_student_relations (teacher_id, created_at DESC, student_id)`,
   `DROP TRIGGER IF EXISTS teacher_accounts_updated_at`,
   `CREATE TRIGGER teacher_accounts_updated_at AFTER UPDATE ON teacher_accounts
      FOR EACH ROW WHEN NEW.updated_at = OLD.updated_at
@@ -171,6 +233,42 @@ async function renameLegacyShape(db, table, legacyMarkerCol) {
 async function seedGovernorates(db) {
   const { GOVERNORATES } = require('../utils/governorates');
   const rows = GOVERNORATES.map((g) => ({ sql: `INSERT OR IGNORE INTO governorates(gov_code,name_ar) VALUES(?,?)`, args: [g.code, g.name] }));
+  await db.batch(rows, 'write');
+}
+
+/** v5 NEW — seed the Cairo educational directorates reference table. @param {RawDb} db */
+async function seedDirectorates(db) {
+  const rows = DIRECTORATES.map((d) => ({
+    sql: `INSERT OR IGNORE INTO directorates(directorate_code, gov_code, directorate_name_ar) VALUES (?,?,?)`,
+    args: [d.code, d.gov_code, d.name_ar],
+  }));
+  await db.batch(rows, 'write');
+}
+
+/** v5 NEW — seed the Egyptian K-12 education stages reference table. @param {RawDb} db */
+async function seedEducationStages(db) {
+  const rows = EDUCATION_STAGES.map((s) => ({
+    sql: `INSERT OR IGNORE INTO education_stages(stage_code, stage_name_ar, grade_from, grade_to, ordinal) VALUES (?,?,?,?,?)`,
+    args: [s.code, s.name_ar, s.grade_from, s.grade_to, s.ordinal],
+  }));
+  await db.batch(rows, 'write');
+}
+
+/** v5 NEW — seed the subject catalog reference table. @param {RawDb} db */
+async function seedSubjects(db) {
+  const rows = SUBJECTS.map((s) => ({
+    sql: `INSERT OR IGNORE INTO subjects(subject_code, subject_name_ar, stage_code, branch, ordinal) VALUES (?,?,?,?,?)`,
+    args: [s.code, s.name_ar, s.stage, s.branch, s.ord],
+  }));
+  await db.batch(rows, 'write');
+}
+
+/** v5 NEW — seed the two-term academic year reference table. @param {RawDb} db */
+async function seedSchoolTerms(db) {
+  const rows = SCHOOL_TERMS.map((t) => ({
+    sql: `INSERT OR IGNORE INTO school_terms(term_code, term_name_ar, ordinal) VALUES (?,?,?)`,
+    args: [t.code, t.name_ar, t.ordinal],
+  }));
   await db.batch(rows, 'write');
 }
 
@@ -230,9 +328,27 @@ async function copyLegacyTables(db) {
  * Explode the legacy v3 JSON columns (grades_json / attendance_json /
  * weekly_json) on each students row into the normalized tables. Idempotent via
  * INSERT OR IGNORE. Uses one batch per student.
+ *
+ * v5 GUARD: this step is OPTIONAL and only does something on databases that
+ * still carry the v3 JSON columns. On a fresh v4/v5 student table the columns
+ * DON'T EXIST — so the SELECT throws "no such column: grades_json" the moment
+ * it runs. v4 swallowed this in the outer catch of `runMigrations`, leaving
+ * seedPortalMetaDefaults and the schema_version stamp unrun → noisy migrations
+ * on every boot. v5 isolates the legacy explode in its own try/catch and runs
+ * the post-explode steps (seedPortalMetaDefaults + setMeta) UNCONDITIONALLY on
+ * firstRun. That's the small guard you approved.
+ *
  * @param {RawDb} db
  */
 async function explodeStudentJson(db) {
+  // First, probe whether the v3 JSON columns even exist — fail fast without
+  // surfacing an error if they don't.
+  const cols = await columnsOf(db, 'students');
+  const hasGradesJson = cols.includes('grades_json');
+  if (!hasGradesJson) {
+    logger.info('Legacy v3 JSON columns absent — skipping explodeStudentJson');
+    return { students: 0, grades: 0, attendance: 0, weekly: 0 };
+  }
   const { rows } = await exec(db, `SELECT ssn_encrypted, grades_json, attendance_json, weekly_json FROM students`);
   let students = rows.length;
   let grades = 0, attendance = 0, weekly = 0;
@@ -283,6 +399,7 @@ async function explodeStudentJson(db) {
     }
   }
   logger.info('Exploded legacy student JSON into normalized tables', { students, grades, attendance, weekly });
+  return { students, grades, attendance, weekly };
 }
 
 /** Seed default schedule/announcements blobs only if absent. @param {RawDb} db */
@@ -308,21 +425,40 @@ async function runMigrations(db) {
     for (const sql of [...STUDENT_DDL, ...NEW_GRADE_DDL, ...NEW_ATTENDANCE_DDL, ...NEW_WEEKLY_DDL, ...TRIGGER_DDL]) {
       await exec(db, sql);
     }
+
+    // 3. v5 NEW — drop the redundant v4 indexes (no-op on fresh DBs).
+    for (const sql of LEGACY_INDEX_CLEANUP_DDL) {
+      try { await exec(db, sql); } catch { /* tolerate ALIAS/AUTH edge cases */ }
+    }
+
+    // 4. Seed all reference tables (idempotent INSERT OR IGNORE; cheap; safe every boot).
     await seedGovernorates(db);
+    await seedDirectorates(db);
+    await seedEducationStages(db);
+    await seedSubjects(db);
+    await seedSchoolTerms(db);
 
     const version = await getMeta(db, 'schema_version');
     const firstRun = version !== SCHEMA_VERSION;
 
-    // Copy aside any legacy normalized tables into the new ones.
+    // Copy aside any legacy normalized tables into the new ones (best-effort).
     await copyLegacyTables(db);
 
     if (firstRun) {
       logger.info(`Running v${SCHEMA_VERSION} one-time data migration`, { previous: version });
-      await migrateTeachersToStaff(db);
-      await backfillSchools(db);
-      await explodeStudentJson(db);
-      await seedPortalMetaDefaults(db);
-      await setMeta(db, 'schema_version', SCHEMA_VERSION);
+
+      // v5 GUARD: each legacy-data step is independently best-effort so a fresh
+      // (no legacy) database reaches the post-steps below reliably.
+      try { await migrateTeachersToStaff(db); } catch (error) { logger.warn('migrateTeachersToStaff skipped', { message: error.message }); }
+      try { await backfillSchools(db); } catch (error) { logger.warn('backfillSchools skipped', { message: error.message }); }
+      try { await explodeStudentJson(db); } catch (error) { logger.warn('explodeStudentJson skipped', { message: error.message }); }
+
+      // These two MUST run even if any legacy step above threw — otherwise
+      // portal_meta defaults go missing and schema_version never stamps,
+      // causing every subsequent boot to retry the migration.
+      try { await seedPortalMetaDefaults(db); } catch (error) { logger.warn('seedPortalMetaDefaults failed', { message: error.message }); }
+      try { await setMeta(db, 'schema_version', SCHEMA_VERSION); } catch (error) { logger.warn('setMeta(schema_version) failed', { message: error.message }); }
+
       logger.info(`Schema v${SCHEMA_VERSION} migration complete`, {});
     }
 
