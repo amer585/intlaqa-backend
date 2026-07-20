@@ -13,6 +13,7 @@ const { registerStaff, addTeacher, assignTeacherClass, listTeacherClasses } = re
 const {
   registerTeacher,
   loginTeacher,
+  checkVerificationStatus,
   getTeacherProfile,
   updateTeacherProfile,
   linkStudent,
@@ -129,6 +130,12 @@ function createApiRouter() {
 
   router.post('/teacher/login', authRateLimiter, asyncHandler(async (req, res) => {
     res.status(200).json(await loginTeacher(req.body));
+  }));
+
+  // Pending teachers can't log in (403 before a JWT is issued) — this
+  // credential-authenticated check lets them poll their approval state.
+  router.post('/teacher/verification-status', authRateLimiter, asyncHandler(async (req, res) => {
+    res.status(200).json(await checkVerificationStatus(req.body));
   }));
 
   router.get('/teacher/profile', authenticateToken, requireTeacherAccount, asyncHandler(async (req, res) => {

@@ -149,7 +149,11 @@ async function loginTeacher(payload = {}) {
       }
 
       if (Number(account.is_verified) !== 1) {
-        throw new AppError(403, 'Your account is pending admin approval. Please try again later.');
+        // Machine-readable code so web/Android clients can render the
+        // "pending approval — check status" surface instead of a raw error.
+        throw new AppError(403, 'Your account is pending admin approval. Please try again later.', {
+          code: 'PENDING_APPROVAL',
+        });
       }
 
       const token = issueToken(account);
@@ -157,6 +161,57 @@ async function loginTeacher(payload = {}) {
         success: true,
         token,
         account: sanitize(account),
+      };
+    });
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw new AppError(500, 'Database query failed', error.message);
+  }
+}
+
+/**
+ * Public verification-status check (TEACHER DB). A pending teacher cannot log
+ * in (403 before a JWT is issued), so this endpoint lets them poll their
+ * approval state using their CREDENTIALS — no token required. The email +
+ * password must match, which keeps the endpoint non-enumerable (identical 401
+ * for unknown email / bad password, mirroring loginTeacher).
+ * @param {{ email?: string, password?: string }} payload
+ */
+async function checkVerificationStatus(payload = {}) {
+  ensureTeacherDb();
+  requireFields(payload, ['email', 'password'], 'email and password are required.');
+  const email = assertValidEmail(payload.email);
+  const password = String(payload.password);
+
+  try {
+    return await withTeacherConnection(async (db) => {
+      const { rows } = await db.execute(
+        `SELECT id, name, is_verified, password_hash
+           FROM teacher_accounts
+          WHERE email = ?
+          LIMIT 1`,
+        [email],
+      );
+      if (rows.length === 0) {
+        throw new AppError(401, 'Invalid email or password.');
+      }
+      const account = rows[0];
+      if (!isBcryptHash(account.password_hash)) {
+        throw new AppError(401, 'Invalid email or password.');
+      }
+      const valid = await bcrypt.compare(password, account.password_hash);
+      if (!valid) {
+        throw new AppError(401, 'Invalid email or password.');
+      }
+      const verified = Number(account.is_verified) === 1;
+      return {
+        id: account.id,
+        name: account.name,
+        is_verified: verified,
+        status: verified ? 'approved' : 'pending',
+        message: verified
+          ? 'Your account has been approved. You can log in now.'
+          : 'Your account is still pending admin approval.',
       };
     });
   } catch (error) {
@@ -480,6 +535,7 @@ function assertCanApprove(user = {}) {
 module.exports = {
   registerTeacher,
   loginTeacher,
+  checkVerificationStatus,
   getTeacherProfile,
   updateTeacherProfile,
   linkStudent,
