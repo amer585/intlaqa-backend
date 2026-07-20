@@ -6,6 +6,7 @@ const jwt = require('jsonwebtoken');
 
 const { config } = require('../config/env');
 const { withConnection, withTeacherConnection, inPlaceholders } = require('../db/client');
+const { getCacheAsync, setCache, invalidate } = require('../db/diskCache');
 const AppError = require('../lib/AppError');
 const logger = require('../lib/logger');
 const { normalizeRole } = require('../utils/roles');
@@ -229,6 +230,20 @@ function requireTeacherId(user) {
   return String(id);
 }
 
+// ── Teacher roster cache (cache-aside, Redis-primary + disk fallback) ──────
+// The roster is a CROSS-DATABASE read: relations come from the TEACHER DB and
+// the student profiles are imported from the STUDENT DB. That is two remote
+// round-trips per dashboard load. The backend owns caching (the web/Android
+// clients only hold a JWT), so we cache the fully-enriched roster under
+// `teacher:<id>:students` and bust it on every link/unlink write — the same
+// read-through pattern the student portal uses (`portal:<ssn>:<grade>`).
+const ROSTER_CACHE_TTL_SEC = 300; // matches REDIS_TTL_SEC default
+
+/** @param {string} teacherId */
+function rosterCacheKey(teacherId) {
+  return `teacher:${teacherId}:students`;
+}
+
 /**
  * Link a student (by ssn_encrypted) to the authenticated teacher.
  * Validates the student exists in the STUDENT DB, stores the relation in the
@@ -269,6 +284,9 @@ async function linkStudent(payload = {}, user = {}) {
       );
     });
 
+    // 3. Bust the roster cache so the next read re-imports from the STUDENT DB.
+    await invalidate(rosterCacheKey(teacherId));
+
     return { message: 'Student linked.', teacher_id: teacherId, student_id: studentId };
   } catch (error) {
     if (error instanceof AppError) throw error;
@@ -279,12 +297,23 @@ async function linkStudent(payload = {}, user = {}) {
 /**
  * List all students linked to the authenticated teacher.
  * Reads relations from the TEACHER DB, then enriches them with live student
- * details from the STUDENT DB (cross-database, best-effort).
+ * details imported from the STUDENT DB (cross-database, best-effort).
+ *
+ * The enriched roster is cached (`teacher:<id>:students`, Redis-primary +
+ * disk fallback) so a teacher dashboard reload is one cache GET instead of
+ * two remote DB round-trips. linkStudent/unlinkStudent bust the key.
  * @param {{ teacher_account_id?: string }} user
  */
 async function listTeacherStudents(user = {}) {
   const teacherId = requireTeacherId(user);
   ensureTeacherDb();
+
+  // ── Read-through: serve the enriched roster from cache when fresh ──
+  const cacheKey = rosterCacheKey(teacherId);
+  const cached = await getCacheAsync(cacheKey);
+  if (cached && Array.isArray(cached.students)) {
+    return { ...cached, cached: true };
+  }
 
   try {
     // 1. Relations live in the TEACHER DB. LIMIT caps payload size.
@@ -301,7 +330,9 @@ async function listTeacherStudents(user = {}) {
     });
 
     if (relations.length === 0) {
-      return { teacher_id: teacherId, students: [] };
+      const empty = { teacher_id: teacherId, students: [] };
+      await setCache(cacheKey, empty, ROSTER_CACHE_TTL_SEC);
+      return { ...empty, cached: false };
     }
 
     const studentIds = relations.map((r) => String(r.student_id));
@@ -337,10 +368,49 @@ async function listTeacherStudents(user = {}) {
       };
     });
 
-    return { teacher_id: teacherId, students };
+    // ── Write-through: cache the enriched roster (imported from student DB) ──
+    const payload = { teacher_id: teacherId, students };
+    await setCache(cacheKey, payload, ROSTER_CACHE_TTL_SEC);
+    return { ...payload, cached: false };
   } catch (error) {
     if (error instanceof AppError) throw error;
     throw new AppError(500, 'Database query failed', error.message);
+  }
+}
+
+/**
+ * Unlink a student from the authenticated teacher (TEACHER DB write), then
+ * bust the cached roster so the next read re-imports from the STUDENT DB.
+ * The student record itself is NEVER deleted — it lives in the student DB;
+ * only the cross-database relation is removed.
+ * @param {string} studentId
+ * @param {{ teacher_account_id?: string }} user
+ */
+async function unlinkStudent(studentId, user = {}) {
+  const teacherId = requireTeacherId(user);
+  ensureTeacherDb();
+  if (!studentId) throw new AppError(400, 'student_id is required.');
+  const sid = String(studentId).trim();
+
+  try {
+    await withTeacherConnection(async (db) => {
+      const result = await db.execute(
+        `DELETE FROM teacher_student_relations
+          WHERE teacher_id = ? AND student_id = ?`,
+        [teacherId, sid],
+      );
+      if (result.rowsAffected === 0) {
+        throw new AppError(404, 'That student is not linked to your account.');
+      }
+    });
+
+    // Bust the roster cache — the next GET re-reads relations + re-imports.
+    await invalidate(rosterCacheKey(teacherId));
+    logger.info('Teacher unlinked student', { teacherId, studentId: sid });
+    return { message: 'Student unlinked.', teacher_id: teacherId, student_id: sid };
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw new AppError(500, 'Failed to unlink student', error.message);
   }
 }
 
@@ -413,6 +483,7 @@ module.exports = {
   getTeacherProfile,
   updateTeacherProfile,
   linkStudent,
+  unlinkStudent,
   listTeacherStudents,
   listPendingTeachers,
   setTeacherVerification,

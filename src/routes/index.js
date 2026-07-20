@@ -16,6 +16,7 @@ const {
   getTeacherProfile,
   updateTeacherProfile,
   linkStudent,
+  unlinkStudent,
   listTeacherStudents,
   listPendingTeachers,
   setTeacherVerification,
@@ -144,6 +145,12 @@ function createApiRouter() {
 
   router.post('/teacher/students', authenticateToken, requireTeacherAccount, asyncHandler(async (req, res) => {
     res.status(201).json(await linkStudent(req.body, req.user));
+  }));
+
+  // Unlink: removes ONLY the relation in the teacher DB — the student record
+  // stays in the student DB. Busts the teacher's cached roster.
+  router.delete('/teacher/students/:id', authenticateToken, requireTeacherAccount, asyncHandler(async (req, res) => {
+    res.status(200).json(await unlinkStudent(req.params.id, req.user));
   }));
 
   // ---- Admin approval of teacher accounts (staff-only) ----
