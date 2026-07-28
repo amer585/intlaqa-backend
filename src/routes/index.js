@@ -22,6 +22,16 @@ const {
   listPendingTeachers,
   setTeacherVerification,
 } = require('../services/teacherAccount.service');
+const {
+  searchStudents,
+  importStudent,
+  addStudent: addStudentForTeacher,
+  getStudentDetail,
+  updateStudent: updateStudentForTeacher,
+  setStudentGrades,
+  setStudentAttendance,
+  getTeacherDashboard,
+} = require('../services/teacherStudent.service');
 const { loginStudent, saveStudent } = require('../services/student.service');
 const { updateGrade } = require('../services/grade.service');
 const { updateAttendance } = require('../services/attendance.service');
@@ -152,6 +162,60 @@ function createApiRouter() {
 
   router.post('/teacher/students', authenticateToken, requireTeacherAccount, asyncHandler(async (req, res) => {
     res.status(201).json(await linkStudent(req.body, req.user));
+  }));
+
+  // ── Teacher ⇄ student bridge (v6) ────────────────────────────────────────
+  // ARCHITECTURE: a teacher's own database holds ONLY identity + relation
+  // pointers. Every student fact is read from / written to the STUDENT
+  // database by the backend, which also owns the cache and the authorization
+  // (a teacher may only touch students present in their relation table).
+  //
+  // NOTE ordering: the literal /search + /dashboard paths are registered
+  // BEFORE the '/teacher/students/:id' parameterized route so Express never
+  // swallows them as an :id.
+
+  // Search the STUDENT database — this is how a teacher finds a student that
+  // is NOT in their own database. Per-teacher cached (60s).
+  router.get('/teacher/students/search', authenticateToken, requireTeacherAccount, asyncHandler(async (req, res) => {
+    res.status(200).json(await searchStudents(req.query, req.user));
+  }));
+
+  // Header stats for the teacher dashboard (derived from the cached roster).
+  router.get('/teacher/dashboard', authenticateToken, requireTeacherAccount, asyncHandler(async (req, res) => {
+    res.status(200).json(await getTeacherDashboard(req.user));
+  }));
+
+  // Import an EXISTING student (student DB) into the teacher's roster.
+  // Only the pointer is stored in the teacher DB; the profile is cached.
+  router.post('/teacher/students/import', authenticateToken, requireTeacherAccount, asyncHandler(async (req, res) => {
+    res.status(201).json(await importStudent(req.body, req.user));
+  }));
+
+  // ADD a brand-new student. The row is created in the STUDENT DATABASE (never
+  // the teacher DB) and then linked. The backend mints the id when omitted.
+  router.post('/teacher/students/add', authenticateToken, requireTeacherAccount, asyncHandler(async (req, res) => {
+    res.status(201).json(await addStudentForTeacher(req.body, req.user));
+  }));
+
+  // Full academic view of one owned student: profile + grades + attendance +
+  // weekly — all imported from the STUDENT DB and cached (180s).
+  router.get('/teacher/students/:id', authenticateToken, requireTeacherAccount, asyncHandler(async (req, res) => {
+    res.status(200).json(await getStudentDetail(req.params.id, req.user));
+  }));
+
+  // EDIT an owned student — the UPDATE lands in the STUDENT DATABASE.
+  router.patch('/teacher/students/:id', authenticateToken, requireTeacherAccount, asyncHandler(async (req, res) => {
+    res.status(200).json(await updateStudentForTeacher(req.params.id, req.body, req.user));
+  }));
+
+  // Teacher grade entry for an owned student → student_grades (STUDENT DB).
+  router.post('/teacher/students/:id/grades', authenticateToken, requireTeacherAccount, asyncHandler(async (req, res) => {
+    res.status(200).json(await setStudentGrades(req.params.id, req.body, req.user));
+  }));
+
+  // Teacher attendance entry for an owned student → attendance (STUDENT DB).
+  router.post('/teacher/students/:id/attendance', authenticateToken, requireTeacherAccount, asyncHandler(async (req, res) => {
+    res.status(200).json(await setStudentAttendance(req.params.id, req.body, req.user));
   }));
 
   // Unlink: removes ONLY the relation in the teacher DB — the student record
